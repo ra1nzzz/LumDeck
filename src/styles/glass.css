@@ -1,0 +1,418 @@
+/* LumDeck visual system: the "Liquid Glass" dock, five styles, three sizes.
+ *
+ * The dock window itself is transparent (see tauri.conf.json). The visible bar
+ * is `.dock`, which paints a frosted panel with backdrop-filter. True backdrop
+ * refraction (light bending through the glass edge) is approximated with a
+ * layered specular highlight + inner edge shading, which reads as glass while
+ * staying robust across WebView2 builds.
+ */
+
+:root {
+  --radius-dock: 22px;
+  --radius-tile: 16px;
+  --gap: 8px;
+  --pad: 8px;
+
+  --dock-h: 76px;
+  --unit: 76px; /* one tile-width unit at md */
+
+  --font: "SF Pro Display", "Segoe UI Variable", "Segoe UI", system-ui, -apple-system,
+    Roboto, Helvetica, Arial, sans-serif;
+
+  /* Liquid (default) — dark refractive glass with a cool specular sheen. */
+  --glass-bg: linear-gradient(180deg, rgba(38, 44, 54, 0.55), rgba(16, 20, 28, 0.62));
+  --glass-blur: 26px;
+  --glass-saturate: 180%;
+  --glass-border: rgba(255, 255, 255, 0.14);
+  --glass-shadow: 0 18px 50px rgba(0, 0, 0, 0.45);
+  --sheen: linear-gradient(
+    180deg,
+    rgba(255, 255, 255, 0.22),
+    rgba(255, 255, 255, 0.04) 42%,
+    rgba(255, 255, 255, 0) 60%
+  );
+
+  --tile-bg: rgba(255, 255, 255, 0.07);
+  --tile-bg-hover: rgba(255, 255, 255, 0.12);
+  --tile-border: rgba(255, 255, 255, 0.1);
+
+  --text: #f2f5f9;
+  --text-dim: rgba(242, 245, 249, 0.62);
+  --text-faint: rgba(242, 245, 249, 0.4);
+  --accent: #4aa3ff;
+  --good: #38d39f;
+  --warn: #ffb020;
+  --bad: #ff5d5d;
+
+  --track: rgba(255, 255, 255, 0.16);
+}
+
+/* ---- Styles -------------------------------------------------------------- */
+[data-style="black"] {
+  --glass-bg: linear-gradient(180deg, rgba(12, 12, 14, 0.9), rgba(6, 6, 8, 0.94));
+  --glass-blur: 10px;
+  --glass-saturate: 120%;
+  --glass-border: rgba(255, 255, 255, 0.08);
+  --glass-shadow: 0 16px 40px rgba(0, 0, 0, 0.6);
+  --sheen: linear-gradient(180deg, rgba(255, 255, 255, 0.06), rgba(255, 255, 255, 0) 50%);
+  --tile-bg: rgba(255, 255, 255, 0.05);
+  --tile-bg-hover: rgba(255, 255, 255, 0.1);
+  --tile-border: rgba(255, 255, 255, 0.07);
+}
+
+[data-style="white"] {
+  --glass-bg: linear-gradient(180deg, rgba(255, 255, 255, 0.72), rgba(240, 242, 247, 0.8));
+  --glass-blur: 24px;
+  --glass-saturate: 160%;
+  --glass-border: rgba(0, 0, 0, 0.08);
+  --glass-shadow: 0 16px 44px rgba(20, 30, 50, 0.28);
+  --sheen: linear-gradient(180deg, rgba(255, 255, 255, 0.7), rgba(255, 255, 255, 0) 55%);
+  --tile-bg: rgba(255, 255, 255, 0.5);
+  --tile-bg-hover: rgba(255, 255, 255, 0.72);
+  --tile-border: rgba(0, 0, 0, 0.06);
+  --text: #10131a;
+  --text-dim: rgba(16, 19, 26, 0.6);
+  --text-faint: rgba(16, 19, 26, 0.4);
+  --accent: #0a84ff;
+  --track: rgba(0, 0, 0, 0.12);
+}
+
+[data-style="ios"] {
+  --glass-bg: linear-gradient(180deg, rgba(255, 255, 255, 0.4), rgba(255, 255, 255, 0.22));
+  --glass-blur: 34px;
+  --glass-saturate: 190%;
+  --glass-border: rgba(255, 255, 255, 0.4);
+  --glass-shadow: 0 20px 50px rgba(0, 0, 0, 0.3);
+  --sheen: linear-gradient(180deg, rgba(255, 255, 255, 0.55), rgba(255, 255, 255, 0) 60%);
+  --tile-bg: rgba(255, 255, 255, 0.34);
+  --tile-bg-hover: rgba(255, 255, 255, 0.5);
+  --tile-border: rgba(255, 255, 255, 0.34);
+  --radius-tile: 20px;
+  --radius-dock: 28px;
+}
+
+[data-style="midnight"] {
+  --glass-bg: linear-gradient(180deg, rgba(10, 14, 30, 0.78), rgba(4, 6, 16, 0.86));
+  --glass-blur: 22px;
+  --glass-saturate: 150%;
+  --glass-border: rgba(120, 150, 255, 0.16);
+  --glass-shadow: 0 20px 54px rgba(0, 0, 10, 0.6);
+  --sheen: linear-gradient(180deg, rgba(120, 150, 255, 0.14), rgba(120, 150, 255, 0) 55%);
+  --tile-bg: rgba(120, 150, 255, 0.08);
+  --tile-bg-hover: rgba(120, 150, 255, 0.14);
+  --tile-border: rgba(120, 150, 255, 0.14);
+  --accent: #7c5cff;
+}
+
+/* ---- Sizes --------------------------------------------------------------- */
+[data-size="sm"] { --dock-h: 58px; --unit: 58px; --gap: 6px; --pad: 6px; --radius-tile: 13px; --radius-dock: 18px; }
+[data-size="md"] { --dock-h: 76px; --unit: 76px; --gap: 8px; --pad: 8px; }
+[data-size="lg"] { --dock-h: 96px; --unit: 96px; --gap: 10px; --pad: 10px; --radius-tile: 20px; --radius-dock: 26px; }
+
+/* ---- Base ---------------------------------------------------------------- */
+* { box-sizing: border-box; }
+html, body, #app { height: 100%; margin: 0; }
+body {
+  font-family: var(--font);
+  color: var(--text);
+  background: transparent;
+  overflow: hidden;
+  user-select: none;
+  -webkit-font-smoothing: antialiased;
+}
+
+.drag-region { -webkit-app-region: drag; app-region: drag; }
+.no-drag { -webkit-app-region: no-drag; app-region: no-drag; }
+
+/* The whole window is a flex column that pins the dock to the chosen edge. */
+.window-root {
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+}
+.window-root[data-edge="bottom"] { justify-content: flex-end; }
+.window-root[data-edge="top"] { justify-content: flex-start; }
+
+.dock {
+  position: relative;
+  margin: 6px 0;
+  height: var(--dock-h);
+  border-radius: var(--radius-dock);
+  background: var(--glass-bg);
+  backdrop-filter: blur(var(--glass-blur)) saturate(var(--glass-saturate));
+  -webkit-backdrop-filter: blur(var(--glass-blur)) saturate(var(--glass-saturate));
+  border: 1px solid var(--glass-border);
+  box-shadow: var(--glass-shadow), inset 0 1px 0 var(--glass-border);
+  overflow: hidden;
+}
+/* Specular sheen across the top of the glass. */
+.dock::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background: var(--sheen);
+  pointer-events: none;
+  border-radius: inherit;
+}
+
+.dock-inner {
+  position: relative;
+  height: 100%;
+  display: flex;
+  align-items: stretch;
+  gap: var(--gap);
+  padding: var(--pad);
+  overflow-x: auto;
+  overflow-y: hidden;
+  scrollbar-width: none;
+}
+.dock-inner::-webkit-scrollbar { display: none; }
+
+/* ---- Tiles --------------------------------------------------------------- */
+.tile {
+  position: relative;
+  flex: 0 0 auto;
+  height: 100%;
+  width: calc(var(--unit) * var(--w, 1));
+  border-radius: var(--radius-tile);
+  background: var(--tile-bg);
+  border: 1px solid var(--tile-border);
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+  transition: background 0.15s ease, transform 0.12s ease;
+  cursor: default;
+}
+.tile:hover { background: var(--tile-bg-hover); }
+.tile.dragging { opacity: 0.4; }
+.tile.drop-target { outline: 2px dashed var(--accent); outline-offset: -2px; }
+
+.tile-body {
+  flex: 1;
+  min-width: 0;
+  padding: 6px 9px;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  gap: 2px;
+  overflow: hidden;
+}
+
+/* Small remove button that appears on hover, top-right of the tile. */
+.tile-remove {
+  position: absolute;
+  top: 3px;
+  right: 3px;
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  border: none;
+  background: var(--bad);
+  color: #fff;
+  font-size: 11px;
+  line-height: 1;
+  display: none;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  z-index: 3;
+  padding: 0;
+}
+.tile:hover .tile-remove { display: flex; }
+
+/* Drag handle: a subtle grip revealed on hover at the tile's top edge. */
+.tile-grip {
+  position: absolute;
+  top: 2px;
+  left: 50%;
+  transform: translateX(-50%);
+  width: 22px;
+  height: 3px;
+  border-radius: 2px;
+  background: var(--text-faint);
+  opacity: 0;
+  cursor: grab;
+  z-index: 2;
+}
+.tile:hover .tile-grip { opacity: 0.7; }
+
+/* ---- Shared widget primitives ------------------------------------------- */
+.w-title { font-size: 10px; letter-spacing: 0.02em; color: var(--text-dim); text-transform: none; }
+.w-big { font-size: 20px; font-weight: 700; line-height: 1.05; }
+.w-value { font-size: 15px; font-weight: 650; }
+.w-dim { color: var(--text-dim); }
+.w-faint { color: var(--text-faint); }
+.w-row { display: flex; align-items: center; gap: 7px; }
+.w-col { display: flex; flex-direction: column; }
+.w-icon { width: 18px; height: 18px; display: inline-flex; }
+.w-icon svg { width: 100%; height: 100%; }
+.w-spacer { flex: 1; }
+.w-accent { color: var(--accent); }
+.w-good { color: var(--good); }
+.w-bad { color: var(--bad); }
+.w-warn { color: var(--warn); }
+.w-mono { font-variant-numeric: tabular-nums; }
+
+.w-error { font-size: 10px; color: var(--text-faint); }
+.w-btn {
+  border: none;
+  background: var(--tile-bg-hover);
+  color: var(--text);
+  border-radius: 8px;
+  padding: 3px 7px;
+  font-size: 11px;
+  cursor: pointer;
+}
+.w-btn:hover { background: var(--accent); color: #fff; }
+
+/* Range slider (brightness / volume). */
+.w-slider {
+  -webkit-app-region: no-drag;
+  width: 100%;
+  height: 6px;
+  border-radius: 3px;
+  background: var(--track);
+  appearance: none;
+  outline: none;
+  cursor: pointer;
+}
+.w-slider::-webkit-slider-thumb {
+  appearance: none;
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  background: #fff;
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.4);
+}
+
+/* Sparkline / bars used by several widgets. */
+.w-bars { display: flex; align-items: flex-end; gap: 2px; height: 26px; }
+.w-bars > i { flex: 1; background: var(--accent); border-radius: 2px 2px 0 0; min-height: 1px; opacity: 0.85; }
+
+/* Circular gauge (CPU / RAM). */
+.w-gauge { position: relative; width: 40px; height: 40px; }
+.w-gauge svg { transform: rotate(-90deg); }
+.w-gauge .g-val { position: absolute; inset: 0; display: grid; place-items: center; font-size: 12px; font-weight: 700; }
+
+/* ---- Modals (picker / settings) ----------------------------------------- */
+.overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.4);
+  backdrop-filter: blur(6px);
+  display: grid;
+  place-items: center;
+  z-index: 50;
+}
+.panel {
+  width: min(880px, 92vw);
+  height: min(620px, 86vh);
+  border-radius: 20px;
+  background: var(--glass-bg);
+  backdrop-filter: blur(30px) saturate(180%);
+  -webkit-backdrop-filter: blur(30px) saturate(180%);
+  border: 1px solid var(--glass-border);
+  box-shadow: 0 30px 80px rgba(0, 0, 0, 0.5);
+  color: var(--text);
+  display: flex;
+  overflow: hidden;
+}
+.panel-side { width: 220px; border-right: 1px solid var(--glass-border); padding: 14px; display: flex; flex-direction: column; gap: 4px; }
+.panel-main { flex: 1; padding: 18px 22px; overflow: auto; }
+.panel h2 { margin: 0 0 4px; font-size: 18px; }
+.panel h3 { margin: 18px 0 10px; font-size: 13px; color: var(--text-dim); font-weight: 600; }
+
+.search {
+  width: 100%;
+  padding: 8px 12px;
+  border-radius: 10px;
+  border: 1px solid var(--glass-border);
+  background: var(--tile-bg);
+  color: var(--text);
+  font-size: 13px;
+  outline: none;
+  margin-bottom: 12px;
+}
+
+.cat {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 10px;
+  border-radius: 10px;
+  cursor: pointer;
+  font-size: 13px;
+  color: var(--text-dim);
+}
+.cat:hover { background: var(--tile-bg-hover); color: var(--text); }
+.cat.active { background: var(--accent); color: #fff; }
+.cat .n { margin-left: auto; font-size: 11px; opacity: 0.7; }
+.cat .ico { width: 16px; height: 16px; }
+.cat .ico svg { width: 100%; height: 100%; }
+
+.wgrid { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 12px; }
+.wcard {
+  border-radius: 14px;
+  background: var(--tile-bg);
+  border: 1px solid var(--tile-border);
+  padding: 14px;
+  cursor: pointer;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  min-height: 92px;
+  transition: transform 0.12s ease, background 0.12s ease;
+}
+.wcard:hover { background: var(--tile-bg-hover); transform: translateY(-2px); }
+.wcard .ico { width: 22px; height: 22px; color: var(--accent); }
+.wcard .ico svg { width: 100%; height: 100%; }
+.wcard .nm { font-size: 13px; font-weight: 600; }
+.wcard .ds { font-size: 11px; color: var(--text-dim); }
+
+.panel-close {
+  position: absolute;
+  top: 12px;
+  right: 14px;
+  width: 28px;
+  height: 28px;
+  border-radius: 50%;
+  border: none;
+  background: var(--tile-bg-hover);
+  color: var(--text);
+  cursor: pointer;
+  font-size: 15px;
+}
+
+.setrow { display: flex; align-items: center; justify-content: space-between; padding: 12px 0; border-bottom: 1px solid var(--glass-border); gap: 16px; }
+.setrow:last-child { border-bottom: none; }
+.setrow .lbl { font-size: 13px; }
+.setrow .sub { font-size: 11px; color: var(--text-dim); margin-top: 2px; }
+.seg { display: flex; gap: 6px; }
+.seg button {
+  border: 1px solid var(--glass-border);
+  background: var(--tile-bg);
+  color: var(--text-dim);
+  border-radius: 9px;
+  padding: 6px 12px;
+  font-size: 12px;
+  cursor: pointer;
+}
+.seg button.active { background: var(--accent); color: #fff; border-color: transparent; }
+
+.switch { position: relative; width: 42px; height: 24px; border-radius: 12px; background: var(--track); cursor: pointer; border: none; transition: background 0.15s; }
+.switch.on { background: var(--good); }
+.switch::after { content: ""; position: absolute; top: 2px; left: 2px; width: 20px; height: 20px; border-radius: 50%; background: #fff; transition: transform 0.15s; }
+.switch.on::after { transform: translateX(18px); }
+
+.style-preview { display: flex; gap: 10px; flex-wrap: wrap; }
+.style-preview .sp {
+  width: 96px; height: 54px; border-radius: 12px; cursor: pointer;
+  border: 2px solid transparent; position: relative; overflow: hidden;
+  display: grid; place-items: center; font-size: 11px; color: #fff;
+}
+.style-preview .sp.active { border-color: var(--accent); }
+.sp[data-s="liquid"] { background: linear-gradient(180deg, rgba(38,44,54,.9), rgba(16,20,28,.95)); }
+.sp[data-s="black"] { background: linear-gradient(180deg, #141417, #06060a); }
+.sp[data-s="white"] { background: linear-gradient(180deg, #f4f5f8, #dfe3ea); color: #10131a; }
+.sp[data-s="ios"] { background: linear-gradient(180deg, rgba(255,255,255,.7), rgba(200,215,235,.6)); color: #10131a; }
+.sp[data-s="midnight"] { background: linear-gradient(180deg, #0e1226, #04060f); }

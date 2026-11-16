@@ -1,0 +1,13 @@
+{
+  "$schema": "../schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "Capability for the main dock window: core window/event/app APIs plus LumDeck commands.",
+  "windows": ["main"],
+  "permissions": [
+    "core:default",
+    "core:window:default",
+    "core:event:default",
+    "core:app:default",
+    "core:webview:default"
+  ]
+}

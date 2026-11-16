@@ -1,0 +1,23 @@
+{
+  "name": "lumdeck",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "description": "LumDeck — a clean-room live widget dock for Windows, inspired by observed behavior of lumabar.",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview",
+    "tauri": "tauri",
+    "app:dev": "tauri dev",
+    "app:build": "tauri build"
+  },
+  "dependencies": {
+    "@tauri-apps/api": "^2.9.0"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2.9.0",
+    "typescript": "^5.6.3",
+    "vite": "^6.0.0"
+  }
+}
