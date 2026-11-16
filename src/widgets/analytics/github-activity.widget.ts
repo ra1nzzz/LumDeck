@@ -1,3 +1,5 @@
+import { sanitizeSecretError } from "../../core/credentials";
+import { fetchJson, isAbortError, isHttpError } from "../../core/http";
 import type { WidgetModule } from "../../core/types";
 
 const githubIcon =
@@ -7,10 +9,28 @@ const refreshIcon =
   '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/></svg>';
 
 /** Read the `rel="last"` page number from a GitHub Link header, if present. */
-function parseLastPage(link: string | null): number | null {
+export function parseLastPage(link: string | null): number | null {
   if (!link) return null;
-  const m = link.match(/[?&]page=(\d+)[^>]*>;\s*rel="last"/);
-  return m ? Number(m[1]) : null;
+  const parts = link.split(/,(?=\s*<)/);
+  for (const part of parts) {
+    const urlMatch = /^\s*<([^>]+)>([\s\S]*)$/.exec(part);
+    if (!urlMatch) continue;
+    const [, rawUrl, params] = urlMatch;
+    const relMatch = /;\s*rel\s*=\s*(?:"([^"]*)"|'([^']*)'|([^;,\s]*))/i.exec(params);
+    if (!relMatch) continue;
+    const rels = (relMatch[1] ?? relMatch[2] ?? relMatch[3] ?? "").trim().split(/\s+/);
+    if (!rels.includes("last")) continue;
+    try {
+      const parsed = new URL(rawUrl, "https://api.github.com");
+      const pageRaw = parsed.searchParams.get("page");
+      if (!pageRaw || !/^\d+$/.test(pageRaw)) return null;
+      const page = Number(pageRaw);
+      return Number.isSafeInteger(page) && page > 0 ? page : null;
+    } catch {
+      return null;
+    }
+  }
+  return null;
 }
 
 const mod: WidgetModule = {
@@ -23,42 +43,104 @@ const mod: WidgetModule = {
   refreshMs: 120000,
   async mount(body, ctx) {
     let token = "";
-    try {
-      token = ((await ctx.getSecret("token")) ?? "").trim();
-    } catch {
-      token = "";
-    }
+    let destroyed = false;
+    let saving = false;
+    let view: "" | "connect" | "connected" | "vault-error" = "";
+    let generation = 0;
+    let activeJob: {
+      key: string;
+      gen: number;
+      controller: AbortController;
+      promise: Promise<void>;
+    } | null = null;
+    let authRejected = false;
+    let retryUntil = 0;
 
-    let abort: AbortController | null = null;
+    const cleanup = () => {
+      if (destroyed) return;
+      destroyed = true;
+      generation++;
+      activeJob?.controller.abort();
+      activeJob = null;
+      ctx.signal?.removeEventListener("abort", cleanup);
+    };
+    ctx.signal?.addEventListener("abort", cleanup, { once: true });
 
-    const renderConnect = () => {
+    const renderConnect = (hint = "") => {
+      if (destroyed) return;
+      view = "connect";
       body.innerHTML = `
-        <div class="w-col" style="gap:6px;height:100%;justify-content:center">
+        <div class="w-col" style="gap:5px;height:100%;justify-content:center">
           <div class="w-row" style="gap:6px">
             <span class="w-icon w-accent" style="width:16px;height:16px">${githubIcon}</span>
             <span class="w-title">Connect GitHub</span>
           </div>
           <div class="w-row" style="gap:6px">
-            <input data-token type="password" class="search" style="margin:0;padding:4px 7px;font-size:11px;flex:1;min-width:0" placeholder="Personal access token" />
+            <input data-token type="password" spellcheck="false" autocomplete="off" class="search" style="margin:0;padding:4px 7px;font-size:11px;flex:1;min-width:0" placeholder="Personal access token" />
             <button data-save class="w-btn" style="padding:4px 8px">Save</button>
           </div>
+          <div class="w-error" data-err style="font-size:10px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${hint.replace(/[<>&"']/g, "")}</div>
         </div>`;
       const input = body.querySelector<HTMLInputElement>("[data-token]")!;
       const save = body.querySelector<HTMLButtonElement>("[data-save]")!;
-      const doSave = () => {
+      const errEl = body.querySelector<HTMLElement>("[data-err]")!;
+      const doSave = async () => {
+        if (saving || destroyed) return;
         const v = input.value.trim();
         if (!v) return;
+        saving = true;
+        save.disabled = true;
+        errEl.textContent = "";
+        try {
+          await ctx.setSecret("token", v);
+        } catch (err) {
+          if (!destroyed) {
+            errEl.textContent = sanitizeSecretError(err, [v]);
+            save.disabled = false;
+          }
+          saving = false;
+          return;
+        }
+        saving = false;
+        if (destroyed) return;
         token = v;
-        void ctx.setSecret("token", v);
+        authRejected = false;
+        retryUntil = 0;
+        generation++;
+        activeJob?.controller.abort();
+        activeJob = null;
         route();
       };
-      save.addEventListener("click", doSave);
+      save.addEventListener("click", () => {
+        void doSave();
+      });
       input.addEventListener("keydown", (e) => {
-        if (e.key === "Enter") doSave();
+        if (e.key === "Enter") void doSave();
+      });
+    };
+
+    const renderVaultError = (msg: string) => {
+      if (destroyed) return;
+      view = "vault-error";
+      body.innerHTML = `
+        <div class="w-col" style="gap:5px;height:100%;justify-content:center">
+          <div class="w-row" style="gap:6px">
+            <span class="w-icon w-accent" style="width:15px;height:15px">${githubIcon}</span>
+            <span class="w-title">Credential vault error</span>
+          </div>
+          <div class="w-row" style="gap:6px;justify-content:space-between">
+            <span class="w-error" data-err style="font-size:10px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${msg.replace(/[<>&"']/g, "")}</span>
+            <button data-retry class="w-btn" style="padding:3px 8px;flex:0 0 auto">Retry</button>
+          </div>
+        </div>`;
+      body.querySelector<HTMLButtonElement>("[data-retry]")!.addEventListener("click", () => {
+        void init();
       });
     };
 
     const renderConnected = () => {
+      if (destroyed || view === "connected") return;
+      view = "connected";
       body.innerHTML = `
         <div class="w-row" style="justify-content:space-between;height:100%">
           <div class="w-col" style="gap:1px;justify-content:center">
@@ -79,6 +161,7 @@ const mod: WidgetModule = {
     };
 
     const showData = (count: string, login: string, unread: number) => {
+      if (destroyed) return;
       const c = body.querySelector<HTMLElement>("[data-count]");
       const l = body.querySelector<HTMLElement>("[data-login]");
       if (c) {
@@ -90,6 +173,7 @@ const mod: WidgetModule = {
     };
 
     const showFallback = (msg: string) => {
+      if (destroyed) return;
       const c = body.querySelector<HTMLElement>("[data-count]");
       const l = body.querySelector<HTMLElement>("[data-login]");
       if (c) {
@@ -99,64 +183,132 @@ const mod: WidgetModule = {
       if (l) l.textContent = msg;
     };
 
-    const refresh = async () => {
-      if (!token) return;
-      if (abort) abort.abort();
-      abort = new AbortController();
+    const refresh = (): Promise<void> => {
+      if (destroyed) return Promise.resolve();
+      const t = token;
+      if (!t || authRejected) {
+        if (view !== "connect") {
+          renderConnect(authRejected ? "Invalid token — paste a new one" : "");
+        }
+        return Promise.resolve();
+      }
+      if (view !== "connected") renderConnected();
+      if (activeJob && activeJob.key === t) {
+        return activeJob.promise;
+      }
+      if (Date.now() < retryUntil) {
+        showFallback("rate limited");
+        return Promise.resolve();
+      }
+
+      activeJob?.controller.abort();
+      const jobGen = ++generation;
+      const controller = new AbortController();
       const headers = {
-        Authorization: `Bearer ${token}`,
+        Authorization: `Bearer ${t}`,
         Accept: "application/vnd.github+json",
       };
-      try {
-        const [userRes, notifRes] = await Promise.all([
-          fetch("https://api.github.com/user", { headers, signal: abort.signal }),
-          fetch("https://api.github.com/notifications?per_page=1", {
-            headers,
-            signal: abort.signal,
-          }),
-        ]);
-        if (userRes.status === 401 || notifRes.status === 401) {
-          showFallback("Invalid token");
-          return;
+
+      const promise = (async () => {
+        try {
+          const [userRes, notifRes] = await Promise.all([
+            fetchJson<{ login?: unknown }>("https://api.github.com/user", {
+              headers,
+              signal: controller.signal,
+              timeoutMs: 10_000,
+              allowNotModified: true,
+            }),
+            fetchJson<unknown>("https://api.github.com/notifications?per_page=1", {
+              headers,
+              signal: controller.signal,
+              timeoutMs: 10_000,
+              allowNotModified: true,
+            }),
+          ]);
+          if (destroyed || jobGen !== generation || controller.signal.aborted) return;
+          retryUntil = 0;
+          const user = userRes.data ?? {};
+          const list = Array.isArray(notifRes.data) ? notifRes.data : [];
+          // With per_page=1 the `rel="last"` page number equals the unread total.
+          const last = parseLastPage(notifRes.headers.get("Link"));
+          const unread = last != null ? last : list.length;
+          const login = typeof user.login === "string" && user.login ? user.login : "—";
+          showData(String(unread), login, unread);
+        } catch (err) {
+          if (isAbortError(err)) return;
+          if (destroyed || jobGen !== generation || controller.signal.aborted) return;
+          controller.abort();
+          if (isHttpError(err, "http")) {
+            if (err.status === 401) {
+              authRejected = true;
+              renderConnect("Invalid token — paste a new one");
+              return;
+            }
+            if (err.status === 403) {
+              showFallback("auth 403");
+              return;
+            }
+            if (err.status === 429) {
+              retryUntil = Date.now() + (err.retryAfterMs ?? 60_000);
+              showFallback("rate limited");
+              return;
+            }
+            showFallback(`GitHub ${err.status}`);
+            return;
+          }
+          if (isHttpError(err, "timeout")) {
+            showFallback("timeout");
+            return;
+          }
+          if (isHttpError(err, "decode")) {
+            showFallback("bad response");
+            return;
+          }
+          showFallback("offline");
+        } finally {
+          if (activeJob?.gen === jobGen) {
+            activeJob = null;
+          }
         }
-        if (!userRes.ok) {
-          showFallback(`GitHub ${userRes.status}`);
-          return;
-        }
-        if (!notifRes.ok) {
-          showFallback(`GitHub ${notifRes.status}`);
-          return;
-        }
-        const user = (await userRes.json()) as { login?: unknown };
-        const notifs = (await notifRes.json()) as unknown;
-        const list = Array.isArray(notifs) ? notifs : [];
-        // With per_page=1 the `rel="last"` page number equals the unread total.
-        const last = parseLastPage(notifRes.headers.get("Link"));
-        const unread = last != null ? last : list.length;
-        const login = typeof user.login === "string" && user.login ? user.login : "—";
-        showData(String(unread), login, unread);
-      } catch (e) {
-        if ((e as { name?: string })?.name === "AbortError") return;
-        showFallback("offline");
-      }
+      })();
+
+      activeJob = { key: t, gen: jobGen, controller, promise };
+      return promise;
     };
 
     const route = () => {
-      if (token) {
+      if (destroyed) return;
+      if (token && !authRejected) {
         renderConnected();
         void refresh();
       } else {
-        renderConnect();
+        renderConnect(authRejected ? "Invalid token — paste a new one" : "");
       }
     };
 
-    route();
+    const init = async (): Promise<void> => {
+      if (destroyed || ctx.signal?.aborted) {
+        cleanup();
+        return;
+      }
+      try {
+        token = ((await ctx.getSecret("token")) ?? "").trim();
+      } catch (err) {
+        if (!destroyed) renderVaultError(sanitizeSecretError(err));
+        return;
+      }
+      if (destroyed || ctx.signal?.aborted) {
+        cleanup();
+        return;
+      }
+      route();
+    };
+
+    await init();
 
     return {
       refresh,
-      destroy: () => {
-        if (abort) abort.abort();
-      },
+      destroy: cleanup,
     };
   },
 };

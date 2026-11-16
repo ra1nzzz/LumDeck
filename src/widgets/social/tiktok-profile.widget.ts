@@ -1,3 +1,4 @@
+import { fetchJson, fetchText, isAbortError, isHttpError } from "../../core/http";
 import type { WidgetModule } from "../../core/types";
 
 const tikTokIcon = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M13.5 2v12.4a4.3 4.3 0 1 1-4.3-4.3"/><path d="M13.5 2c.6 3.5 3 5.7 6.5 6.1"/></svg>`;
@@ -70,17 +71,6 @@ const readHtmlStats = (html: string): TikTokStats | null => {
   });
 };
 
-/** fetch that never hangs: TikTok's endpoints are usually CORS-blocked from a webview. */
-const fetchWithTimeout = async (url: string, ms: number): Promise<Response> => {
-  const ctrl = new AbortController();
-  const timer = window.setTimeout(() => ctrl.abort(), ms);
-  try {
-    return await fetch(url, { signal: ctrl.signal });
-  } finally {
-    window.clearTimeout(timer);
-  }
-};
-
 const mod: WidgetModule = {
   id: "tiktok-profile",
   name: "TikTok",
@@ -91,8 +81,16 @@ const mod: WidgetModule = {
   refreshMs: 300000,
   mount(body, ctx) {
     let username = asString(ctx.settings.username);
-    let loading = false;
     let view: "main" | "connect" = username ? "main" : "connect";
+    let alive = true;
+    let generation = 0;
+    let activeJob: {
+      key: string;
+      gen: number;
+      controller: AbortController;
+      promise: Promise<void>;
+    } | null = null;
+    let retryUntil = 0;
 
     const q = <T extends HTMLElement>(sel: string): T => body.querySelector<T>(sel)!;
 
@@ -148,17 +146,22 @@ const mod: WidgetModule = {
       el.title = title;
     };
 
+    const clearStats = (note: string) => {
+      setStat("[data-followers]", undefined, "");
+      setStat("[data-following]", undefined, "");
+      setStat("[data-likes]", undefined, "");
+      setNote(note);
+    };
+
     const showMain = () => {
       view = "main";
       body.innerHTML = mainView();
       showUser();
-      setNote("");
-      setStat("[data-followers]", undefined, "");
-      setStat("[data-following]", undefined, "");
-      setStat("[data-likes]", undefined, "");
+      clearStats("");
       q<HTMLButtonElement>("[data-refresh]").addEventListener("click", () => void refresh());
       q<HTMLButtonElement>("[data-edit]").addEventListener("click", () => {
         ctx.setSettings({ username: "" });
+        applyUsername("");
       });
     };
 
@@ -168,7 +171,9 @@ const mod: WidgetModule = {
       const input = q<HTMLInputElement>("[data-username]");
       const save = () => {
         const next = input.value.trim().replace(/^@/, "");
-        if (next) ctx.setSettings({ username: next });
+        if (!next) return;
+        ctx.setSettings({ username: next });
+        applyUsername(next);
       };
       q<HTMLButtonElement>("[data-save]").addEventListener("click", save);
       input.addEventListener("keydown", (e) => {
@@ -176,66 +181,131 @@ const mod: WidgetModule = {
       });
     };
 
-    const refresh = async () => {
-      if (!username) {
+    const applyUsername = (next: string) => {
+      if (!alive || next === username) return;
+      username = next;
+      generation++;
+      activeJob?.controller.abort();
+      activeJob = null;
+      retryUntil = 0;
+      if (username) {
+        showMain();
+        void refresh();
+      } else {
         showConnect();
-        return;
-      }
-      if (view === "connect") showMain();
-      if (loading) return;
-      loading = true;
-      try {
-        let stats: TikTokStats | null = null;
-        const user = encodeURIComponent(username);
-        for (const url of [
-          `https://www.tiktok.com/api/user/detail/?uniqueId=${user}`,
-          `https://tiktok.com/api/user/detail/?uniqueId=${user}`,
-        ]) {
-          try {
-            const res = await fetchWithTimeout(url, 7000);
-            if (!res.ok) continue;
-            stats = readStats((await res.json()) as unknown);
-            if (stats) break;
-          } catch {
-            // endpoint unreachable or CORS-blocked — try the next one
-          }
-        }
-        if (!stats) {
-          try {
-            const res = await fetchWithTimeout(`https://www.tiktok.com/@${user}`, 7000);
-            if (res.ok) stats = readHtmlStats(await res.text());
-          } catch {
-            // profile page not reachable either
-          }
-        }
-        if (!stats) {
-          setStat("[data-followers]", undefined, "");
-          setStat("[data-following]", undefined, "");
-          setStat("[data-likes]", undefined, "");
-          setNote("connect");
-          return;
-        }
-        setStat("[data-followers]", stats.followerCount, "followers");
-        setStat("[data-following]", stats.followingCount, "following");
-        setStat("[data-likes]", stats.heartCount, "likes");
-        setNote("");
-      } catch {
-        setStat("[data-followers]", undefined, "");
-        setStat("[data-following]", undefined, "");
-        setStat("[data-likes]", undefined, "");
-        setNote("connect");
-      } finally {
-        loading = false;
       }
     };
 
+    const refresh = (): Promise<void> => {
+      if (!alive) return Promise.resolve();
+      if (!username) {
+        showConnect();
+        return Promise.resolve();
+      }
+      if (view === "connect") showMain();
+
+      const targetUser = username;
+      if (activeJob && activeJob.key === targetUser) {
+        return activeJob.promise;
+      }
+
+      if (Date.now() < retryUntil) {
+        clearStats("rate limited");
+        return Promise.resolve();
+      }
+
+      activeJob?.controller.abort();
+      const jobGen = ++generation;
+      const controller = new AbortController();
+
+      const promise = (async () => {
+        try {
+          let stats: TikTokStats | null = null;
+          let authStatus: number | undefined;
+          let rateLimited = false;
+          const user = encodeURIComponent(targetUser);
+
+          for (const url of [
+            `https://www.tiktok.com/api/user/detail/?uniqueId=${user}`,
+            `https://tiktok.com/api/user/detail/?uniqueId=${user}`,
+          ]) {
+            if (!alive || jobGen !== generation || controller.signal.aborted) return;
+            try {
+              const res = await fetchJson<unknown>(url, {
+                signal: controller.signal,
+                timeoutMs: 7000,
+              });
+              if (!alive || jobGen !== generation || controller.signal.aborted) return;
+              if (!res.noContent && res.data !== undefined) {
+                stats = readStats(res.data);
+                if (stats) break;
+              }
+            } catch (err) {
+              if (isAbortError(err)) return;
+              if (isHttpError(err, "http")) {
+                if (err.status === 429) {
+                  rateLimited = true;
+                  retryUntil = Date.now() + (err.retryAfterMs ?? 60_000);
+                  break;
+                }
+                if (err.status === 401 || err.status === 403) {
+                  authStatus = err.status;
+                }
+              }
+            }
+          }
+
+          if (!stats && !rateLimited) {
+            if (!alive || jobGen !== generation || controller.signal.aborted) return;
+            try {
+              const res = await fetchText(`https://www.tiktok.com/@${user}`, {
+                signal: controller.signal,
+                timeoutMs: 7000,
+              });
+              if (!alive || jobGen !== generation || controller.signal.aborted) return;
+              if (!res.noContent && typeof res.data === "string") {
+                stats = readHtmlStats(res.data);
+              }
+            } catch (err) {
+              if (isAbortError(err)) return;
+              if (isHttpError(err, "http")) {
+                if (err.status === 429) {
+                  rateLimited = true;
+                  retryUntil = Date.now() + (err.retryAfterMs ?? 60_000);
+                } else if (err.status === 401 || err.status === 403) {
+                  authStatus = err.status;
+                }
+              }
+            }
+          }
+
+          if (!alive || jobGen !== generation || controller.signal.aborted) return;
+
+          if (!stats) {
+            if (rateLimited) clearStats("rate limited");
+            else if (authStatus !== undefined) clearStats(`auth ${authStatus}`);
+            else clearStats("connect");
+            return;
+          }
+
+          retryUntil = 0;
+          setStat("[data-followers]", stats.followerCount, "followers");
+          setStat("[data-following]", stats.followingCount, "following");
+          setStat("[data-likes]", stats.heartCount, "likes");
+          setNote("");
+        } finally {
+          if (activeJob?.gen === jobGen) {
+            activeJob = null;
+          }
+        }
+      })();
+
+      activeJob = { key: targetUser, gen: jobGen, controller, promise };
+      return promise;
+    };
+
     const offSettings = ctx.onSettings((s) => {
-      const next = asString(s.username);
-      if (next === username) return;
-      username = next;
-      if (username) showMain();
-      else showConnect();
-      if (username) void refresh();
+      applyUsername(asString(s.username));
     });
 
     if (username) showMain();
@@ -244,7 +314,13 @@ const mod: WidgetModule = {
 
     return {
       refresh,
-      destroy: () => offSettings(),
+      destroy: () => {
+        alive = false;
+        generation++;
+        activeJob?.controller.abort();
+        activeJob = null;
+        offSettings();
+      },
     };
   },
 };

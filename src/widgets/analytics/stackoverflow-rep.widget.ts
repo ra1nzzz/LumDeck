@@ -1,3 +1,4 @@
+import { fetchJson, isAbortError, isHttpError } from "../../core/http";
 import type { WidgetModule } from "../../core/types";
 
 const soIcon =
@@ -44,7 +45,15 @@ const mod: WidgetModule = {
     let userId = readId();
     let site = readSite();
 
-    let abort: AbortController | null = null;
+    let alive = true;
+    let generation = 0;
+    let activeJob: {
+      key: string;
+      gen: number;
+      controller: AbortController;
+      promise: Promise<void>;
+    } | null = null;
+    let retryUntil = 0;
     let offSettings: (() => void) | null = null;
 
     const renderConnect = () => {
@@ -64,9 +73,8 @@ const mod: WidgetModule = {
       const doSave = () => {
         const v = input.value.trim();
         if (!v) return;
-        userId = v;
         ctx.setSettings({ userId: v });
-        route();
+        applyConfig(v, site);
       };
       save.addEventListener("click", doSave);
       input.addEventListener("keydown", (e) => {
@@ -115,36 +123,87 @@ const mod: WidgetModule = {
       const n = body.querySelector<HTMLElement>("[data-name]");
       if (r) r.textContent = "–";
       if (n) n.textContent = msg;
+      setBadge("[data-gold]", 0);
+      setBadge("[data-silver]", 0);
+      setBadge("[data-bronze]", 0);
     };
 
-    const refresh = async () => {
-      if (!userId) return;
-      if (abort) abort.abort();
-      abort = new AbortController();
-      const url = `https://api.stackexchange.com/2.3/users/${encodeURIComponent(userId)}?site=${encodeURIComponent(site)}`;
-      try {
-        const res = await fetch(url, { signal: abort.signal });
-        if (!res.ok) {
-          showFallback(`SE ${res.status}`);
-          return;
-        }
-        const data = (await res.json()) as { items?: SoUser[] };
-        const u = Array.isArray(data.items) && data.items.length ? data.items[0] : null;
-        if (!u) {
-          showFallback("not found");
-          return;
-        }
-        const rep = typeof u.reputation === "number" ? u.reputation : NaN;
-        const name = typeof u.display_name === "string" && u.display_name ? u.display_name : "—";
-        showData(compact(rep), name);
-        const bc = u.badge_counts ?? {};
-        setBadge("[data-gold]", bc.gold);
-        setBadge("[data-silver]", bc.silver);
-        setBadge("[data-bronze]", bc.bronze);
-      } catch (e) {
-        if ((e as { name?: string })?.name === "AbortError") return;
-        showFallback("offline");
+    const refresh = (): Promise<void> => {
+      if (!alive || !userId) return Promise.resolve();
+      const targetUserId = userId;
+      const targetSite = site;
+      const key = `${targetUserId}\0${targetSite}`;
+      if (activeJob && activeJob.key === key) {
+        return activeJob.promise;
       }
+
+      if (Date.now() < retryUntil) {
+        showFallback("rate limited");
+        return Promise.resolve();
+      }
+
+      activeJob?.controller.abort();
+      const jobGen = ++generation;
+      const controller = new AbortController();
+      const url = `https://api.stackexchange.com/2.3/users/${encodeURIComponent(targetUserId)}?site=${encodeURIComponent(targetSite)}`;
+
+      const promise = (async () => {
+        try {
+          const res = await fetchJson<{ items?: SoUser[] }>(url, {
+            signal: controller.signal,
+            timeoutMs: 10_000,
+          });
+          if (!alive || jobGen !== generation || controller.signal.aborted) return;
+          if (res.noContent || !res.data) {
+            showFallback("not found");
+            return;
+          }
+          const u =
+            Array.isArray(res.data.items) && res.data.items.length ? res.data.items[0] : null;
+          if (!u) {
+            showFallback("not found");
+            return;
+          }
+          retryUntil = 0;
+          const rep = typeof u.reputation === "number" ? u.reputation : NaN;
+          const name = typeof u.display_name === "string" && u.display_name ? u.display_name : "—";
+          showData(compact(rep), name);
+          const bc = u.badge_counts ?? {};
+          setBadge("[data-gold]", bc.gold);
+          setBadge("[data-silver]", bc.silver);
+          setBadge("[data-bronze]", bc.bronze);
+        } catch (err) {
+          if (isAbortError(err)) return;
+          if (!alive || jobGen !== generation || controller.signal.aborted) return;
+          if (isHttpError(err, "http")) {
+            if (err.status === 429) {
+              retryUntil = Date.now() + (err.retryAfterMs ?? 60_000);
+              showFallback("rate limited");
+            } else if (err.status === 401 || err.status === 403) {
+              showFallback(`auth ${err.status}`);
+            } else {
+              showFallback(`SE ${err.status}`);
+            }
+            return;
+          }
+          if (isHttpError(err, "timeout")) {
+            showFallback("timeout");
+            return;
+          }
+          if (isHttpError(err, "decode")) {
+            showFallback("bad response");
+            return;
+          }
+          showFallback("offline");
+        } finally {
+          if (activeJob?.gen === jobGen) {
+            activeJob = null;
+          }
+        }
+      })();
+
+      activeJob = { key, gen: jobGen, controller, promise };
+      return promise;
     };
 
     const route = () => {
@@ -156,6 +215,17 @@ const mod: WidgetModule = {
       }
     };
 
+    const applyConfig = (nextId: string, nextSite: string) => {
+      if (!alive || (nextId === userId && nextSite === site)) return;
+      userId = nextId;
+      site = nextSite;
+      generation++;
+      activeJob?.controller.abort();
+      activeJob = null;
+      retryUntil = 0;
+      route();
+    };
+
     offSettings = ctx.onSettings((s) => {
       const id =
         typeof s.userId === "number"
@@ -164,11 +234,7 @@ const mod: WidgetModule = {
             ? s.userId.trim()
             : "";
       const st = typeof s.site === "string" && s.site.trim() ? s.site.trim() : "stackoverflow";
-      if (id !== userId || st !== site) {
-        userId = id;
-        site = st;
-        route();
-      }
+      applyConfig(id, st);
     });
 
     route();
@@ -176,7 +242,10 @@ const mod: WidgetModule = {
     return {
       refresh,
       destroy: () => {
-        if (abort) abort.abort();
+        alive = false;
+        generation++;
+        activeJob?.controller.abort();
+        activeJob = null;
         if (offSettings) offSettings();
       },
     };

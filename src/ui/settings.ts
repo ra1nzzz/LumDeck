@@ -1,7 +1,26 @@
 import { store, type DockSize, type DockStyle } from "../core/store";
-import { invoke } from "../core/tauri";
+import { hasTauri as moduleHasTauri, invoke } from "../core/tauri";
 
 let isOpen = false;
+
+function isTauriRuntime(): boolean {
+  if (moduleHasTauri === true) return true;
+  if (
+    typeof window !== "undefined" &&
+    ("__TAURI__" in window || "__TAURI_INTERNALS__" in window)
+  ) {
+    return true;
+  }
+  // Support partial test mocks of core/tauri that export invoke without hasTauri.
+  return moduleHasTauri === undefined;
+}
+
+function formatTaskbarError(err: unknown): string {
+  const raw = err instanceof Error ? err.message : typeof err === "string" ? err : "";
+  const trimmed = raw.trim();
+  if (!trimmed) return "Failed to update taskbar auto-hide.";
+  return trimmed.length > 96 ? `${trimmed.slice(0, 93)}...` : trimmed;
+}
 
 const STYLES: { id: DockStyle; label: string }[] = [
   { id: "liquid", label: "Liquid Glass" },
@@ -80,14 +99,50 @@ export function openSettings(): void {
 
   // Auto-hide taskbar
   const hideRow = row(panel, "Auto-hide taskbar", "Let LumDeck own the edge while it runs.");
+  const hideErr = document.createElement("div");
+  hideErr.className = "sub w-bad";
+  hideErr.dataset.taskbarError = "";
+  hideErr.setAttribute("role", "alert");
+  hideErr.style.display = "none";
+  hideRow.firstElementChild?.appendChild(hideErr);
+
+  const setHideError = (msg: string | null) => {
+    if (!msg) {
+      hideErr.textContent = "";
+      hideErr.style.display = "none";
+      return;
+    }
+    hideErr.textContent = msg;
+    hideErr.style.display = "";
+  };
+
   const sw = document.createElement("button");
   sw.type = "button";
   sw.className = "switch" + (store.get().autoHideTaskbar ? " on" : "");
+  let taskbarPending = false;
   sw.addEventListener("click", () => {
-    const next = !store.get().autoHideTaskbar;
-    store.setPrefs({ autoHideTaskbar: next });
-    sw.classList.toggle("on", next);
-    void invoke("taskbar_autohide", { enabled: next });
+    if (taskbarPending) return;
+    const prev = store.get().autoHideTaskbar;
+    const next = !prev;
+    taskbarPending = true;
+    sw.disabled = true;
+    setHideError(null);
+
+    void (async () => {
+      try {
+        if (isTauriRuntime()) {
+          await invoke("taskbar_autohide", { enabled: next });
+        }
+        store.setPrefs({ autoHideTaskbar: next });
+        sw.classList.toggle("on", next);
+      } catch (err) {
+        sw.classList.toggle("on", prev);
+        setHideError(formatTaskbarError(err));
+      } finally {
+        taskbarPending = false;
+        sw.disabled = false;
+      }
+    })();
   });
   hideRow.appendChild(sw);
 

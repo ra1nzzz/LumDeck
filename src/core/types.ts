@@ -27,6 +27,8 @@ export interface WidgetContext {
   invoke: <T = unknown>(cmd: string, args?: Record<string, unknown>) => Promise<T>;
   /** This placed instance's stable id (use it to namespace secrets). */
   readonly uid: string;
+  /** Optional lifecycle signal aborted as soon as the tile unmounts. */
+  readonly signal?: AbortSignal;
   /** Current persisted NON-secret settings for this widget instance. */
   readonly settings: SettingsBag;
   /** Merge + persist NON-secret settings for this widget instance. */
@@ -35,12 +37,20 @@ export interface WidgetContext {
    * Store a SECRET (API key / token / OAuth token) in the OS credential vault
    * (Windows Credential Manager via the Rust backend), namespaced to this
    * instance. NEVER persist secrets via setSettings — that lands in plaintext
-   * localStorage. Resolves even when the backend is unavailable (dev/browser).
+   * localStorage. Uses an in-memory session store in browser preview (without
+   * writing plaintext to localStorage) and rejects on backend/persistence failure.
    */
   setSecret: (key: string, value: string) => Promise<void>;
-  /** Read a previously stored secret, or null if absent/unavailable. */
+  /**
+   * Read a previously stored secret, or `null` when unconfigured.
+   * Rejects when the credential backend or migration persistence fails so
+   * callers can distinguish "not configured" from a vault fault.
+   */
   getSecret: (key: string) => Promise<string | null>;
-  /** Remove a stored secret. */
+  /**
+   * Remove a stored secret (idempotent when already absent).
+   * Rejects when the credential backend or persistence fails.
+   */
   deleteSecret: (key: string) => Promise<void>;
   /** Subscribe to settings changes (including external). Returns an unsubscribe fn. */
   onSettings: (handler: (settings: SettingsBag) => void) => () => void;

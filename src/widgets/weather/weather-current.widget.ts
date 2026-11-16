@@ -1,3 +1,4 @@
+import { fetchJson, isAbortError, isHttpError } from "../../core/http";
 import type { WidgetModule, SettingsBag } from "../../core/types";
 import { icons } from "../icons";
 
@@ -110,24 +111,6 @@ function describe(code: number, isDay: boolean): { icon: string; label: string }
 const fmtTemp = (v: number | undefined): string =>
   typeof v === "number" && Number.isFinite(v) ? String(Math.round(v)) : "–";
 
-/** fetch with a timeout; an externally supplied signal is honoured too. */
-async function fetchTimeout(url: string, opts: RequestInit = {}, ms = 10000): Promise<Response> {
-  const ac = new AbortController();
-  const t = setTimeout(() => ac.abort(), ms);
-  const outer = opts.signal;
-  const onAbort = () => ac.abort();
-  if (outer) {
-    if (outer.aborted) ac.abort();
-    else outer.addEventListener("abort", onAbort, { once: true });
-  }
-  try {
-    return await fetch(url, { ...opts, signal: ac.signal });
-  } finally {
-    clearTimeout(t);
-    outer?.removeEventListener("abort", onAbort);
-  }
-}
-
 const mod: WidgetModule = {
   id: "weather-current",
   name: "Weather",
@@ -136,10 +119,17 @@ const mod: WidgetModule = {
   icon: GLYPH.cloudSun,
   defaultSize: { w: 2, h: 1 },
   refreshMs: 600000,
-  async mount(body, ctx) {
+  mount(body, ctx) {
     let loc = readLocation(ctx.settings);
     let alive = true;
-    let ac: AbortController | null = null;
+    let generation = 0;
+    let activeJob: {
+      key: string;
+      gen: number;
+      controller: AbortController;
+      promise: Promise<void>;
+    } | null = null;
+    let retryUntil = 0;
 
     body.innerHTML = `
       <div class="w-col" style="gap:3px;height:100%;justify-content:center">
@@ -195,6 +185,25 @@ const mod: WidgetModule = {
     };
     editBtn.addEventListener("click", () => setEditing(editor.style.display === "none"));
 
+    const showFallback = (label: string) => {
+      ico.innerHTML = GLYPH.cloud;
+      temp.textContent = "–";
+      condLabel.textContent = label;
+      meta.textContent = " ";
+    };
+
+    const applyLocation = (next: Location) => {
+      if (!alive) return;
+      if (next.lat === loc.lat && next.lon === loc.lon && next.label === loc.label) return;
+      loc = next;
+      syncEditor();
+      generation++;
+      activeJob?.controller.abort();
+      activeJob = null;
+      retryUntil = 0;
+      void refresh();
+    };
+
     const save = () => {
       const lat = Number(latI.value.trim());
       const lon = Number(lonI.value.trim());
@@ -203,7 +212,9 @@ const mod: WidgetModule = {
         return;
       }
       const label = labelI.value.trim() || DEFAULT_LOC.label;
-      ctx.setSettings({ location: { lat, lon, label } });
+      const next = { lat, lon, label };
+      ctx.setSettings({ location: next });
+      applyLocation(next);
       setEditing(false);
     };
     saveBtn.addEventListener("click", save);
@@ -214,54 +225,95 @@ const mod: WidgetModule = {
     }
 
     const unsub = ctx.onSettings((s) => {
-      const next = readLocation(s);
-      if (next.lat !== loc.lat || next.lon !== loc.lon || next.label !== loc.label) {
-        loc = next;
-        syncEditor();
-        void refresh();
-      }
+      applyLocation(readLocation(s));
     });
 
-    const refresh = async (): Promise<void> => {
-      ac?.abort();
-      const ctrl = new AbortController();
-      ac = ctrl;
+    const refresh = (): Promise<void> => {
+      if (!alive) return Promise.resolve();
+      const targetLoc = { ...loc };
+      const key = `${targetLoc.lat},${targetLoc.lon},${targetLoc.label}`;
+      if (activeJob && activeJob.key === key) {
+        return activeJob.promise;
+      }
+
+      if (Date.now() < retryUntil) {
+        showFallback("Rate limited");
+        return Promise.resolve();
+      }
+
+      activeJob?.controller.abort();
+      const jobGen = ++generation;
+      const controller = new AbortController();
       const url =
-        `https://api.open-meteo.com/v1/forecast?latitude=${loc.lat}&longitude=${loc.lon}` +
+        `https://api.open-meteo.com/v1/forecast?latitude=${targetLoc.lat}&longitude=${targetLoc.lon}` +
         `&current=temperature_2m,weather_code,is_day,wind_speed_10m` +
         `&daily=temperature_2m_max,temperature_2m_min,weather_code&timezone=auto`;
-      try {
-        const res = await fetchTimeout(url, { signal: ctrl.signal }, 12000);
-        if (!res.ok) throw new Error(`HTTP ${res.status}`);
-        const data = (await res.json()) as CurrentResponse;
-        if (!alive || ctrl.signal.aborted) return;
-        const c = data.current;
-        if (!c) throw new Error("no current block");
-        const cond = describe(Number(c.weather_code ?? -1), c.is_day !== 0);
-        ico.innerHTML = cond.icon;
-        temp.textContent = `${fmtTemp(c.temperature_2m)}°`;
-        condLabel.textContent = `${cond.label} · ${loc.label}`;
-        const d = data.daily;
-        const wind = typeof c.wind_speed_10m === "number" ? Math.round(c.wind_speed_10m) : null;
-        meta.textContent =
-          `H ${fmtTemp(d?.temperature_2m_max?.[0])}°  L ${fmtTemp(d?.temperature_2m_min?.[0])}°` +
-          (wind === null ? "" : `  ${wind} km/h`);
-      } catch {
-        if (!alive || ctrl.signal.aborted) return;
-        ico.innerHTML = GLYPH.cloud;
-        temp.textContent = "–";
-        condLabel.textContent = "No connection";
-        meta.textContent = " ";
-      }
+
+      const promise = (async () => {
+        try {
+          const res = await fetchJson<CurrentResponse>(url, {
+            signal: controller.signal,
+            timeoutMs: 12_000,
+          });
+          if (!alive || jobGen !== generation || controller.signal.aborted) return;
+          if (res.noContent || !res.data?.current) {
+            showFallback("Invalid data");
+            return;
+          }
+          retryUntil = 0;
+          const data = res.data;
+          const c = data.current!;
+          const cond = describe(Number(c.weather_code ?? -1), c.is_day !== 0);
+          ico.innerHTML = cond.icon;
+          temp.textContent = `${fmtTemp(c.temperature_2m)}°`;
+          condLabel.textContent = `${cond.label} · ${targetLoc.label}`;
+          const d = data.daily;
+          const wind = typeof c.wind_speed_10m === "number" ? Math.round(c.wind_speed_10m) : null;
+          meta.textContent =
+            `H ${fmtTemp(d?.temperature_2m_max?.[0])}°  L ${fmtTemp(d?.temperature_2m_min?.[0])}°` +
+            (wind === null ? "" : `  ${wind} km/h`);
+        } catch (err) {
+          if (isAbortError(err)) return;
+          if (!alive || jobGen !== generation || controller.signal.aborted) return;
+          if (isHttpError(err, "http")) {
+            if (err.status === 429) {
+              retryUntil = Date.now() + (err.retryAfterMs ?? 60_000);
+              showFallback("Rate limited");
+            } else if (err.status === 401 || err.status === 403) {
+              showFallback(`Auth ${err.status}`);
+            } else {
+              showFallback(`HTTP ${err.status}`);
+            }
+            return;
+          }
+          if (isHttpError(err, "timeout")) {
+            showFallback("Timed out");
+            return;
+          }
+          if (isHttpError(err, "decode")) {
+            showFallback("Invalid data");
+            return;
+          }
+          showFallback("No connection");
+        } finally {
+          if (activeJob?.gen === jobGen) {
+            activeJob = null;
+          }
+        }
+      })();
+
+      activeJob = { key, gen: jobGen, controller, promise };
+      return promise;
     };
 
-    await refresh();
+    void refresh();
     return {
       refresh,
       destroy: () => {
         alive = false;
-        ac?.abort();
-        ac = null;
+        generation++;
+        activeJob?.controller.abort();
+        activeJob = null;
         unsub();
       },
     };

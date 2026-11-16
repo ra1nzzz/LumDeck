@@ -1,3 +1,5 @@
+import { sanitizeSecretError } from "../../core/credentials";
+import { fetchJson, isAbortError, isHttpError } from "../../core/http";
 import type { WidgetModule } from "../../core/types";
 import { icons } from "../icons";
 
@@ -6,24 +8,6 @@ interface GmailLabel {
 }
 
 const LABELS_URL = "https://gmail.googleapis.com/gmail/v1/users/me/labels/INBOX";
-
-/** fetch with a timeout; an externally supplied signal is honoured too. */
-async function fetchTimeout(url: string, opts: RequestInit = {}, ms = 10000): Promise<Response> {
-  const ac = new AbortController();
-  const t = setTimeout(() => ac.abort(), ms);
-  const outer = opts.signal;
-  const onAbort = () => ac.abort();
-  if (outer) {
-    if (outer.aborted) ac.abort();
-    else outer.addEventListener("abort", onAbort, { once: true });
-  }
-  try {
-    return await fetch(url, { ...opts, signal: ac.signal });
-  } finally {
-    clearTimeout(t);
-    outer?.removeEventListener("abort", onAbort);
-  }
-}
 
 const mod: WidgetModule = {
   id: "gmail-unread",
@@ -35,11 +19,8 @@ const mod: WidgetModule = {
   refreshMs: 120000,
   async mount(body, ctx) {
     let token = "";
-    try {
-      token = ((await ctx.getSecret("accessToken")) ?? "").trim();
-    } catch {
-      token = "";
-    }
+    let destroyed = false;
+    let saving = false;
 
     const mainHtml = `
       <div class="w-row" style="justify-content:space-between;height:100%;gap:4px">
@@ -59,18 +40,37 @@ const mod: WidgetModule = {
           <div class="w-icon w-accent" style="width:15px;height:15px">${icons.mail}</div>
           <span class="w-title">Connect Gmail</span>
         </div>
-        <input data-token class="search" style="margin:0;padding:4px 7px;font-size:11px"
-          placeholder="Paste access token (gmail.readonly)" />
-        <button class="w-btn" data-save style="align-self:flex-start">Save</button>
-        ${hint ? `<div class="w-error">${hint}</div>` : ""}
+        <div class="w-row" style="gap:5px">
+          <input data-token type="password" spellcheck="false" autocomplete="off" class="search" style="margin:0;padding:4px 7px;font-size:11px;flex:1;min-width:0"
+            placeholder="Paste access token (gmail.readonly)" />
+          <button class="w-btn" data-save style="padding:4px 8px;flex:0 0 auto">Save</button>
+        </div>
+        <div class="w-error" data-err style="font-size:10px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${hint.replace(/[<>&"']/g, "")}</div>
       </div>`;
 
-    let view: "" | "main" | "connect" = "";
-    let ac: AbortController | null = null;
-    let busy = false;
+    let view: "" | "main" | "connect" | "vault-error" = "";
+    let generation = 0;
+    let activeJob: {
+      key: string;
+      gen: number;
+      controller: AbortController;
+      promise: Promise<void>;
+    } | null = null;
+    let authRejected = false;
+    let retryUntil = 0;
+
+    const cleanup = () => {
+      if (destroyed) return;
+      destroyed = true;
+      generation++;
+      activeJob?.controller.abort();
+      activeJob = null;
+      ctx.signal?.removeEventListener("abort", cleanup);
+    };
+    ctx.signal?.addEventListener("abort", cleanup, { once: true });
 
     const showMain = () => {
-      if (view === "main") return;
+      if (destroyed || view === "main") return;
       view = "main";
       body.innerHTML = mainHtml;
       body.querySelector<HTMLButtonElement>("[data-refresh]")!.addEventListener("click", () => {
@@ -79,79 +79,179 @@ const mod: WidgetModule = {
     };
 
     const showConnect = (hint: string) => {
+      if (destroyed) return;
       view = "connect";
       body.innerHTML = connectHtml(hint);
       const input = body.querySelector<HTMLInputElement>("[data-token]")!;
+      const saveBtn = body.querySelector<HTMLButtonElement>("[data-save]")!;
+      const errEl = body.querySelector<HTMLElement>("[data-err]")!;
       const save = async () => {
+        if (saving || destroyed) return;
         const value = input.value.trim();
         if (!value) return;
+        saving = true;
+        saveBtn.disabled = true;
+        errEl.textContent = "";
+        try {
+          await ctx.setSecret("accessToken", value);
+        } catch (err) {
+          if (!destroyed) {
+            errEl.textContent = sanitizeSecretError(err, [value]);
+            saveBtn.disabled = false;
+          }
+          saving = false;
+          return;
+        }
+        saving = false;
+        if (destroyed) return;
         token = value;
-        await ctx.setSecret("accessToken", value);
+        authRejected = false;
+        retryUntil = 0;
+        generation++;
+        activeJob?.controller.abort();
+        activeJob = null;
         showMain();
         void refresh();
       };
-      body.querySelector<HTMLButtonElement>("[data-save]")!.addEventListener("click", save);
+      saveBtn.addEventListener("click", () => {
+        void save();
+      });
       input.addEventListener("keydown", (e) => {
-        if (e.key === "Enter") save();
+        if (e.key === "Enter") void save();
+      });
+    };
+
+    const showVaultError = (msg: string) => {
+      if (destroyed) return;
+      view = "vault-error";
+      body.innerHTML = `
+        <div class="w-col" style="gap:5px;height:100%;justify-content:center">
+          <div class="w-row" style="gap:6px">
+            <div class="w-icon w-accent" style="width:15px;height:15px">${icons.mail}</div>
+            <span class="w-title">Credential vault error</span>
+          </div>
+          <div class="w-row" style="gap:6px;justify-content:space-between">
+            <span class="w-error" data-err style="font-size:10px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${msg.replace(/[<>&"']/g, "")}</span>
+            <button class="w-btn" data-retry style="padding:3px 8px;flex:0 0 auto">Retry</button>
+          </div>
+        </div>`;
+      body.querySelector<HTMLButtonElement>("[data-retry]")!.addEventListener("click", () => {
+        void init();
       });
     };
 
     const setCount = (text: string, label: string) => {
+      if (destroyed) return;
       const c = body.querySelector<HTMLElement>("[data-count]");
       const l = body.querySelector<HTMLElement>("[data-label]");
       if (c) c.textContent = text;
       if (l) l.textContent = label;
     };
 
-    const refresh = async () => {
+    const refresh = (): Promise<void> => {
+      if (destroyed) return Promise.resolve();
       const t = token;
-      if (!t) {
-        showConnect("");
+      if (!t || authRejected) {
+        if (view !== "connect") {
+          showConnect(authRejected ? "Token expired — paste a new one" : "");
+        }
+        return Promise.resolve();
+      }
+      if (view !== "main") showMain();
+      if (activeJob && activeJob.key === t) {
+        return activeJob.promise;
+      }
+      if (Date.now() < retryUntil) {
+        setCount("–", "rate limited");
+        return Promise.resolve();
+      }
+
+      activeJob?.controller.abort();
+      const jobGen = ++generation;
+      const controller = new AbortController();
+      setCount("…", "inbox");
+
+      const promise = (async () => {
+        try {
+          const res = await fetchJson<GmailLabel>(LABELS_URL, {
+            headers: { Authorization: `Bearer ${t}` },
+            signal: controller.signal,
+            timeoutMs: 10_000,
+            allowNotModified: true,
+          });
+          if (destroyed || jobGen !== generation || controller.signal.aborted) return;
+          retryUntil = 0;
+          if (res.noContent || !res.data) {
+            setCount("–", "inbox");
+            return;
+          }
+          const unread = typeof res.data.messagesUnread === "number" ? res.data.messagesUnread : 0;
+          setCount(String(unread), "inbox");
+        } catch (err) {
+          if (isAbortError(err)) return;
+          if (destroyed || jobGen !== generation || controller.signal.aborted) return;
+          if (isHttpError(err, "http")) {
+            if (err.status === 401) {
+              authRejected = true;
+              showConnect("Token expired — paste a new one");
+              return;
+            }
+            if (err.status === 403) {
+              setCount("–", "auth 403");
+              return;
+            }
+            if (err.status === 429) {
+              retryUntil = Date.now() + (err.retryAfterMs ?? 60_000);
+              setCount("–", "rate limited");
+              return;
+            }
+            setCount("–", `HTTP ${err.status}`);
+            return;
+          }
+          if (isHttpError(err, "timeout")) {
+            setCount("–", "timeout");
+            return;
+          }
+          setCount("–", "inbox");
+        } finally {
+          if (activeJob?.gen === jobGen) {
+            activeJob = null;
+          }
+        }
+      })();
+
+      activeJob = { key: t, gen: jobGen, controller, promise };
+      return promise;
+    };
+
+    const init = async (): Promise<void> => {
+      if (destroyed || ctx.signal?.aborted) {
+        cleanup();
         return;
       }
-      if (busy) return;
-      busy = true;
-      ac?.abort();
-      const ctrl = new AbortController();
-      ac = ctrl;
-      if (view === "connect") showMain();
-      setCount("…", "inbox");
       try {
-        const res = await fetchTimeout(
-          LABELS_URL,
-          { headers: { Authorization: `Bearer ${t}` }, signal: ctrl.signal },
-          10000,
-        );
-        if (ctrl.signal.aborted) return;
-        if (res.status === 401) {
-          showConnect("Token expired — paste a new one");
-          return;
-        }
-        if (!res.ok) throw new Error(`HTTP ${res.status}`);
-        const data = (await res.json()) as GmailLabel;
-        const unread = typeof data.messagesUnread === "number" ? data.messagesUnread : 0;
-        setCount(String(unread), "inbox");
-      } catch {
-        if (ctrl.signal.aborted) return;
-        setCount("–", "inbox");
-      } finally {
-        busy = false;
+        token = ((await ctx.getSecret("accessToken")) ?? "").trim();
+      } catch (err) {
+        if (!destroyed) showVaultError(sanitizeSecretError(err));
+        return;
+      }
+      if (destroyed || ctx.signal?.aborted) {
+        cleanup();
+        return;
+      }
+      if (token) {
+        showMain();
+        void refresh();
+      } else {
+        showConnect("");
       }
     };
 
-    if (token) {
-      showMain();
-      await refresh();
-    } else {
-      showConnect("");
-    }
+    await init();
 
     return {
       refresh,
-      destroy: () => {
-        ac?.abort();
-        ac = null;
-      },
+      destroy: cleanup,
     };
   },
 };

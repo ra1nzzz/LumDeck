@@ -1,5 +1,5 @@
-import { store, type DockPrefs, type PlacedWidget } from "../core/store";
-import { invoke, listen } from "../core/tauri";
+import { store, type DockEdge, type DockPrefs, type DockSize, type PlacedWidget } from "../core/store";
+import { hasTauri as moduleHasTauri, invoke, listen } from "../core/tauri";
 import { renderTile } from "./tile";
 import { openPicker } from "../ui/picker";
 import { openSettings } from "../ui/settings";
@@ -7,17 +7,54 @@ import { openSettings } from "../ui/settings";
 let inner: HTMLElement;
 let root: HTMLElement;
 let lastSignature = "";
+let lastEdge: DockEdge | null = null;
+let lastSize: DockSize | null = null;
+let lastSentGeomKey = "";
+let repositionInFlight: Promise<void> | null = null;
+let repositionQueued = false;
+let taskbarTogglePending = false;
+let bootCleanup: (() => void) | null = null;
 // uid -> mounted tile element, so reorders/updates can be reconciled without
 // destroying and re-mounting every widget.
 const mounted = new Map<string, HTMLElement>();
 
+const DEFAULT_DOCK_H: Record<DockSize, number> = { sm: 58, md: 76, lg: 96 };
+
+function isTauriRuntime(): boolean {
+  if (moduleHasTauri === true) return true;
+  if (
+    typeof window !== "undefined" &&
+    ("__TAURI__" in window || "__TAURI_INTERNALS__" in window)
+  ) {
+    return true;
+  }
+  // Support partial test mocks of core/tauri that export invoke without hasTauri.
+  return moduleHasTauri === undefined;
+}
+
 export function boot(): void {
+  bootCleanup?.();
+  bootCleanup = null;
+
+  for (const el of mounted.values()) {
+    (el as unknown as { __destroy?: () => void }).__destroy?.();
+  }
+  mounted.clear();
+  lastSignature = "";
+  lastEdge = null;
+  lastSize = null;
+  lastSentGeomKey = "";
+  repositionInFlight = null;
+  repositionQueued = false;
+  taskbarTogglePending = false;
+
   const app = document.getElementById("app")!;
   app.innerHTML = "";
 
+  const initial = store.get();
   root = document.createElement("div");
   root.className = "window-root drag-region";
-  root.dataset.edge = store.get().edge;
+  root.dataset.edge = initial.edge;
 
   const dock = document.createElement("div");
   dock.className = "dock drag-region";
@@ -29,13 +66,26 @@ export function boot(): void {
   root.appendChild(dock);
   app.appendChild(root);
 
-  applyPrefs(store.get());
+  applyPrefs(initial);
+  lastEdge = initial.edge;
+  lastSize = initial.size;
   renderTiles();
 
-  store.subscribe(onStoreChange);
-  enableDrag();
+  const lifecycleAc = new AbortController();
+  const unsubStore = store.subscribe(onStoreChange);
+  const unsubScale = watchScaleChange(() => {
+    void reposition();
+  });
+  enableDrag(lifecycleAc.signal);
   wireContextMenu(dock);
-  wireTray();
+  const unsubTray = wireTray();
+
+  bootCleanup = () => {
+    lifecycleAc.abort();
+    unsubStore();
+    unsubScale();
+    unsubTray();
+  };
 
   void reposition();
   void applyTaskbar();
@@ -60,7 +110,11 @@ function onStoreChange(prefs: DockPrefs): void {
   if (sig !== lastSignature) {
     renderTiles();
   }
-  void reposition();
+  if (prefs.edge !== lastEdge || prefs.size !== lastSize) {
+    lastEdge = prefs.edge;
+    lastSize = prefs.size;
+    void reposition();
+  }
 }
 
 function renderTiles(): void {
@@ -108,21 +162,82 @@ function renderTiles(): void {
   }
 }
 
-function dockHeightPx(): number {
+// Returns logical CSS pixel height; Rust scales to physical pixels using the target monitor's scale factor.
+function dockHeightPx(size: DockSize): number {
   const v = getComputedStyle(document.documentElement).getPropertyValue("--dock-h");
-  return (parseInt(v, 10) || 76) + 12;
+  return (parseInt(v, 10) || DEFAULT_DOCK_H[size]) + 12;
+}
+
+function currentScale(): number {
+  const dpr = typeof window !== "undefined" ? window.devicePixelRatio : 1;
+  return Number.isFinite(dpr) && dpr > 0 ? dpr : 1;
+}
+
+function watchScaleChange(onChange: () => void): () => void {
+  if (typeof window === "undefined" || typeof window.matchMedia !== "function") {
+    return () => {};
+  }
+  let stopCurrent: (() => void) | null = null;
+  let active = true;
+
+  const observe = () => {
+    stopCurrent?.();
+    stopCurrent = null;
+    if (!active) return;
+    const mql = window.matchMedia(`(resolution: ${currentScale()}dppx)`);
+    if (!mql || typeof mql.addEventListener !== "function") return;
+    const onDprChange = () => {
+      if (!active) return;
+      observe();
+      onChange();
+    };
+    mql.addEventListener("change", onDprChange, { once: true });
+    stopCurrent = () => mql.removeEventListener("change", onDprChange);
+  };
+
+  observe();
+  return () => {
+    active = false;
+    stopCurrent?.();
+    stopCurrent = null;
+  };
 }
 
 async function reposition(): Promise<void> {
+  if (!isTauriRuntime()) return;
+  if (repositionInFlight) {
+    // Coalesce rapid edge/size/scale updates into a single follow-up IPC call.
+    repositionQueued = true;
+    return;
+  }
+
   const prefs = store.get();
-  try {
-    await invoke("dock_position", { edge: prefs.edge, heightPx: dockHeightPx() });
-  } catch {
-    /* running in a browser during dev — ignore */
+  const heightPx = dockHeightPx(prefs.size);
+  const geomKey = `${prefs.edge}:${prefs.size}:${heightPx}:${currentScale()}`;
+  if (geomKey === lastSentGeomKey) return;
+
+  lastSentGeomKey = geomKey;
+  const task = (async () => {
+    try {
+      await invoke("dock_position", { edge: prefs.edge, heightPx });
+    } catch {
+      if (lastSentGeomKey === geomKey) {
+        lastSentGeomKey = "";
+      }
+    }
+  })();
+  repositionInFlight = task;
+  await task;
+  repositionInFlight = null;
+
+  if (repositionQueued) {
+    repositionQueued = false;
+    await reposition();
   }
 }
 
 async function applyTaskbar(): Promise<void> {
+  if (!isTauriRuntime()) return;
   try {
     await invoke("taskbar_autohide", { enabled: store.get().autoHideTaskbar });
   } catch {
@@ -130,8 +245,24 @@ async function applyTaskbar(): Promise<void> {
   }
 }
 
+async function toggleTaskbarAutoHide(): Promise<void> {
+  if (taskbarTogglePending) return;
+  const next = !store.get().autoHideTaskbar;
+  taskbarTogglePending = true;
+  try {
+    if (isTauriRuntime()) {
+      await invoke("taskbar_autohide", { enabled: next });
+    }
+    store.setPrefs({ autoHideTaskbar: next });
+  } catch {
+    /* keep prior autoHideTaskbar preference when native update fails */
+  } finally {
+    taskbarTogglePending = false;
+  }
+}
+
 // ---- Drag to reorder ------------------------------------------------------
-function enableDrag(): void {
+function enableDrag(signal: AbortSignal): void {
   let dragUid: string | null = null;
   let startX = 0;
   let startY = 0;
@@ -148,42 +279,50 @@ function enableDrag(): void {
     startY = e.clientY;
   });
 
-  window.addEventListener("pointermove", (e) => {
-    if (!dragUid) return;
-    if (!active && Math.abs(e.clientX - startX) + Math.abs(e.clientY - startY) > 5) {
-      active = true;
-      inner.querySelector(`.tile[data-uid="${dragUid}"]`)?.classList.add("dragging");
-    }
-    if (!active) return;
-    const tiles = [...inner.querySelectorAll<HTMLElement>(".tile:not(.dragging)")];
-    let idx = tiles.length;
-    for (let i = 0; i < tiles.length; i++) {
-      const r = tiles[i].getBoundingClientRect();
-      if (e.clientX < r.left + r.width / 2) {
-        idx = i;
-        break;
+  window.addEventListener(
+    "pointermove",
+    (e) => {
+      if (!dragUid) return;
+      if (!active && Math.abs(e.clientX - startX) + Math.abs(e.clientY - startY) > 5) {
+        active = true;
+        mounted.get(dragUid)?.classList.add("dragging");
       }
-    }
-    inner.querySelectorAll(".tile.drop-target").forEach((el) => el.classList.remove("drop-target"));
-    if (tiles[idx]) tiles[idx].classList.add("drop-target");
-    targetIndex = idx;
-  });
+      if (!active) return;
+      const tiles = [...inner.querySelectorAll<HTMLElement>(".tile:not(.dragging)")];
+      let idx = tiles.length;
+      for (let i = 0; i < tiles.length; i++) {
+        const r = tiles[i].getBoundingClientRect();
+        if (e.clientX < r.left + r.width / 2) {
+          idx = i;
+          break;
+        }
+      }
+      inner.querySelectorAll(".tile.drop-target").forEach((el) => el.classList.remove("drop-target"));
+      if (tiles[idx]) tiles[idx].classList.add("drop-target");
+      targetIndex = idx;
+    },
+    { signal },
+  );
 
-  window.addEventListener("pointerup", () => {
-    if (!dragUid) return;
-    inner.querySelector(`.tile[data-uid="${dragUid}"]`)?.classList.remove("dragging");
-    inner.querySelectorAll(".tile.drop-target").forEach((el) => el.classList.remove("drop-target"));
-    if (active && targetIndex >= 0) {
-      const layout = store.get().layout;
-      const from = layout.findIndex((p) => p.uid === dragUid);
-      // targetIndex already indexes the array with the dragged tile excluded,
-      // which is exactly what moveWidget (splice-then-insert) expects.
-      store.moveWidget(from, targetIndex);
-    }
-    dragUid = null;
-    active = false;
-    targetIndex = -1;
-  });
+  window.addEventListener(
+    "pointerup",
+    () => {
+      if (!dragUid) return;
+      mounted.get(dragUid)?.classList.remove("dragging");
+      inner.querySelectorAll(".tile.drop-target").forEach((el) => el.classList.remove("drop-target"));
+      if (active && targetIndex >= 0) {
+        const layout = store.get().layout;
+        const from = layout.findIndex((p) => p.uid === dragUid);
+        // targetIndex already indexes the array with the dragged tile excluded,
+        // which is exactly what moveWidget (splice-then-insert) expects.
+        store.moveWidget(from, targetIndex);
+      }
+      dragUid = null;
+      active = false;
+      targetIndex = -1;
+    },
+    { signal },
+  );
 }
 
 // ---- Right-click context menu --------------------------------------------
@@ -225,8 +364,7 @@ function showMenu(x: number, y: number): void {
   menu.appendChild(sep());
   menu.appendChild(
     item("Auto-hide taskbar", () => {
-      store.setPrefs({ autoHideTaskbar: !prefs.autoHideTaskbar });
-      void applyTaskbar();
+      void toggleTaskbarAutoHide();
     }, prefs.autoHideTaskbar ? "on" : "off"),
   );
   menu.appendChild(sep());
@@ -260,20 +398,22 @@ function closeMenu(): void {
 }
 
 async function quit(): Promise<void> {
-  try {
-    await invoke("taskbar_autohide", { enabled: false });
-  } catch {
-    /* ignore */
+  if (!isTauriRuntime()) {
+    window.close();
+    return;
   }
   try {
-    const { getCurrentWindow } = await import("@tauri-apps/api/window");
-    await getCurrentWindow().close();
+    await invoke("quit_app");
   } catch {
-    window.close();
+    /* keep app state consistent if quit_app fails */
   }
 }
 
-function wireTray(): void {
-  listen("tray:widgets", () => openPicker());
-  listen("tray:settings", () => openSettings());
+function wireTray(): () => void {
+  const unsubWidgets = listen("tray:widgets", () => openPicker());
+  const unsubSettings = listen("tray:settings", () => openSettings());
+  return () => {
+    unsubWidgets();
+    unsubSettings();
+  };
 }

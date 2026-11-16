@@ -1,3 +1,5 @@
+import { sanitizeSecretError } from "../../core/credentials";
+import { classifyIpcUnavailable, type IpcUnavailableReason } from "../../core/tauri";
 import type { WidgetModule } from "../../core/types";
 import { icons } from "../icons";
 
@@ -87,14 +89,6 @@ const escapeHtml = (s: string): string =>
     }
   });
 
-const errText = (e: unknown): string => (e instanceof Error && e.message ? e.message : String(e));
-
-/** True when the invoke rejected because the `ai_usage` command isn't registered in this build. */
-const isCommandMissing = (e: unknown): boolean => {
-  const msg = errText(e).toLowerCase();
-  return msg.includes("not found") || msg.includes("ai_usage");
-};
-
 const mod: WidgetModule = {
   id: "ai-usage",
   name: "AI Usage",
@@ -106,13 +100,11 @@ const mod: WidgetModule = {
   async mount(body, ctx) {
     let provider: ProviderId = isProvider(ctx.settings.provider) ? ctx.settings.provider : "claude";
     let sessionKey = "";
-    try {
-      sessionKey = ((await ctx.getSecret("sessionKey")) ?? "").trim();
-    } catch {
-      sessionKey = "";
-    }
-    let view: "main" | "connect" | "unavailable" = "main";
+    let view: "main" | "connect" | "unavailable" | "vault-error" = "main";
+    let unavailableReason: IpcUnavailableReason | null = null;
     let busy = false;
+    let saving = false;
+    let destroyed = false;
     let note = "";
 
     const def = (): ProviderDef => PROVIDERS.find((p) => p.id === provider) ?? PROVIDERS[0];
@@ -152,20 +144,39 @@ const mod: WidgetModule = {
         <span class="w-title" style="font-weight:650">Connect your ${def().label} account</span>
         <span class="w-faint" style="font-size:10px;line-height:1.35">Reads your own sign-in, read-only — usage never leaves this machine.</span>
         <div class="w-row" style="gap:5px">
-          <input data-token class="search" style="margin:0;padding:4px 7px;font-size:11px;flex:1" type="password" placeholder="Session key (optional)" />
+          <input data-token class="search" style="margin:0;padding:4px 7px;font-size:11px;flex:1" type="password" spellcheck="false" autocomplete="off" placeholder="Session key (optional)" />
           <button class="w-btn" data-connect style="padding:4px 9px">Connect</button>
         </div>
-        ${note ? `<div class="w-error">${escapeHtml(note)}</div>` : ""}
+        <div class="w-error" data-err style="font-size:10px">${note ? escapeHtml(note) : ""}</div>
       </div>`;
 
-    const unavailableHtml = (): string => `
+    const unavailableHtml = (): string => {
+      const isPreview = unavailableReason === "preview";
+      const title = isPreview
+        ? "AI Usage · browser preview"
+        : "AI Usage · not available in this build";
+      const detail = isPreview
+        ? "Run inside the LumDeck desktop app — native backend is unavailable here."
+        : "The native ai_usage command isn't registered in this build.";
+      return `
       <div class="w-col" style="gap:5px">
-        <span class="w-title" style="font-weight:650">AI Usage · not available in this build</span>
-        <span class="w-faint" style="font-size:10px;line-height:1.35">The backend command isn't wired up yet — usage can't be read.</span>
+        <span class="w-title" style="font-weight:650">${title}</span>
+        <span class="w-faint" style="font-size:10px;line-height:1.35">${detail}</span>
         ${note ? `<div class="w-error">${escapeHtml(note)}</div>` : ""}
+      </div>`;
+    };
+
+    const vaultErrorHtml = (): string => `
+      <div class="w-col" style="gap:5px">
+        <span class="w-title" style="font-weight:650">Credential vault error</span>
+        <div class="w-row" style="gap:6px;justify-content:space-between">
+          <span class="w-error" data-err style="font-size:10px">${note ? escapeHtml(note) : "Could not read credential vault"}</span>
+          <button class="w-btn" data-retry style="padding:3px 8px;flex:0 0 auto">Retry</button>
+        </div>
       </div>`;
 
     const renderChips = (): void => {
+      if (destroyed) return;
       const wrap = body.querySelector<HTMLElement>("[data-chips]");
       if (!wrap) return;
       wrap.innerHTML = "";
@@ -183,17 +194,18 @@ const mod: WidgetModule = {
           `border:1px solid ${active ? "transparent" : "var(--tile-border)"}`,
         ].join(";");
         chip.addEventListener("click", () => {
-          if (p.id === provider) return;
+          if (p.id === provider || destroyed) return;
           provider = p.id;
           ctx.setSettings({ provider: p.id });
           render();
-          void refresh();
+          if (unavailableReason === null) void refresh();
         });
         wrap.appendChild(chip);
       }
     };
 
     const paintWindow = (key: string, w: Record<string, unknown>): void => {
+      if (destroyed) return;
       const pctEl = body.querySelector<HTMLElement>(`[data-pct="${key}"]`);
       const barEl = body.querySelector<HTMLElement>(`[data-bar="${key}"]`);
       const subEl = body.querySelector<HTMLElement>(`[data-sub="${key}"]`);
@@ -221,6 +233,7 @@ const mod: WidgetModule = {
     };
 
     const paintPending = (): void => {
+      if (destroyed) return;
       for (const key of ["session", "weekly"]) {
         const pctEl = body.querySelector<HTMLElement>(`[data-pct="${key}"]`);
         if (pctEl) {
@@ -231,6 +244,7 @@ const mod: WidgetModule = {
     };
 
     const render = (): void => {
+      if (destroyed) return;
       body.style.setProperty("--p", def().color);
       body.innerHTML = layoutHtml();
       renderChips();
@@ -241,35 +255,69 @@ const mod: WidgetModule = {
             ? connectHtml()
             : view === "unavailable"
               ? unavailableHtml()
-              : mainHtml();
+              : view === "vault-error"
+                ? vaultErrorHtml()
+                : mainHtml();
       }
       if (view === "connect") {
         const input = body.querySelector<HTMLInputElement>("[data-token]");
         const connect = body.querySelector<HTMLButtonElement>("[data-connect]");
+        const errEl = body.querySelector<HTMLElement>("[data-err]");
         const save = async () => {
+          if (saving || destroyed) return;
           const key = input?.value.trim() ?? "";
+          saving = true;
+          if (connect) connect.disabled = true;
+          if (errEl) errEl.textContent = "";
           if (key) {
-            sessionKey = key;
-            await ctx.setSecret("sessionKey", key);
+            try {
+              await ctx.setSecret("sessionKey", key);
+            } catch (err) {
+              const safeMsg = sanitizeSecretError(err, [key]);
+              note = safeMsg;
+              if (!destroyed) {
+                if (errEl) errEl.textContent = safeMsg;
+                if (connect) connect.disabled = false;
+              }
+              saving = false;
+              return;
+            }
           }
+          saving = false;
+          if (destroyed) return;
+          if (key) sessionKey = key;
+          note = "";
           ctx.setSettings({ connected: true });
           view = "main";
           render();
           void refresh();
         };
-        connect?.addEventListener("click", save);
-        input?.addEventListener("keydown", (e) => {
-          if (e.key === "Enter") save();
+        connect?.addEventListener("click", () => {
+          void save();
         });
-      } else {
+        input?.addEventListener("keydown", (e) => {
+          if (e.key === "Enter") void save();
+        });
+      } else if (view === "vault-error") {
+        body.querySelector<HTMLButtonElement>("[data-retry]")?.addEventListener("click", () => {
+          void init();
+        });
+      } else if (view !== "unavailable") {
         paintPending();
       }
-      body.querySelector<HTMLButtonElement>("[data-refresh]")?.addEventListener("click", () => {
-        void refresh();
-      });
+      const refreshBtn = body.querySelector<HTMLButtonElement>("[data-refresh]");
+      if (unavailableReason !== null && refreshBtn) {
+        refreshBtn.disabled = true;
+        refreshBtn.style.opacity = "0.4";
+      } else {
+        refreshBtn?.addEventListener("click", () => {
+          void refresh();
+        });
+      }
     };
 
     const refresh = async (): Promise<void> => {
+      if (destroyed || view === "vault-error" || unavailableReason !== null) return;
       if (busy) return;
       busy = true;
       paintPending();
@@ -277,6 +325,7 @@ const mod: WidgetModule = {
         const args: Record<string, unknown> = { provider };
         if (sessionKey) args.sessionKey = sessionKey;
         const raw = await ctx.invoke<unknown>("ai_usage", args);
+        if (destroyed) return;
         const data = rec(raw);
         if (!Object.keys(data).length) throw new Error("no usage data");
         view = "main";
@@ -291,11 +340,17 @@ const mod: WidgetModule = {
         if (mostEl) mostEl.textContent = most ? `most used: ${most}` : "\u00a0";
         note = "";
       } catch (e) {
-        note = errText(e);
-        if (isCommandMissing(e)) {
+        if (destroyed) return;
+        const missingReason = classifyIpcUnavailable(e, ["ai_usage"]);
+        if (missingReason) {
+          unavailableReason = missingReason;
+          note = "";
           view = "unavailable";
           render();
-        } else if (connected()) {
+          return;
+        }
+        note = sanitizeSecretError(e, [sessionKey]);
+        if (connected()) {
           view = "main";
           render();
           paintWindow("session", {});
@@ -323,10 +378,33 @@ const mod: WidgetModule = {
       void refresh();
     });
 
-    render();
-    await refresh();
+    const cleanup = () => {
+      if (destroyed) return;
+      destroyed = true;
+      offSettings();
+      ctx.signal?.removeEventListener("abort", cleanup);
+    };
+    ctx.signal?.addEventListener("abort", cleanup, { once: true });
 
-    return { refresh, destroy: () => offSettings() };
+    const init = async (): Promise<void> => {
+      try {
+        sessionKey = ((await ctx.getSecret("sessionKey")) ?? "").trim();
+        note = "";
+      } catch (err) {
+        note = sanitizeSecretError(err);
+        view = "vault-error";
+        if (!destroyed) render();
+        return;
+      }
+      if (destroyed || ctx.signal?.aborted) return;
+      view = "main";
+      render();
+      void refresh();
+    };
+
+    await init();
+
+    return { refresh, destroy: cleanup };
   },
 };
 

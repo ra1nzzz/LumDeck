@@ -1,3 +1,4 @@
+import { classifyIpcUnavailable, type IpcUnavailableReason } from "../../core/tauri";
 import type { WidgetModule } from "../../core/types";
 import { icons } from "../icons";
 
@@ -35,9 +36,11 @@ const mod: WidgetModule = {
     const slider = body.querySelector<HTMLInputElement>("[data-slider]")!;
     const val = body.querySelector<HTMLElement>("[data-val]")!;
     const device = body.querySelector<HTMLElement>("[data-device]")!;
-    let failed = false;
+    let destroyed = false;
+    let unavailableReason: IpcUnavailableReason | null = null;
 
     const apply = (v: VolumeState) => {
+      if (destroyed || unavailableReason !== null) return;
       const pct = Math.max(0, Math.min(100, Math.round(v.level * 100)));
       if (document.activeElement !== slider) slider.value = String(pct);
       val.textContent = v.muted ? "muted" : `${pct}%`;
@@ -46,45 +49,66 @@ const mod: WidgetModule = {
       muteBtn.innerHTML = v.muted ? mutedGlyph : volumeGlyph;
     };
 
-    const unavailable = () => {
-      if (failed) return;
-      failed = true;
+    const unavailable = (reason: IpcUnavailableReason) => {
+      if (destroyed || unavailableReason !== null) return;
+      unavailableReason = reason;
+      muteBtn.disabled = true;
+      slider.disabled = true;
+      const label =
+        reason === "preview"
+          ? "Volume · browser preview"
+          : "Volume · not available in this build";
       body.innerHTML = `
         <div class="w-row" style="gap:8px;height:100%">
           <div class="w-icon w-faint" style="width:18px;height:18px">${icons.volume}</div>
-          <span class="w-dim" style="font-size:12px">Volume not available</span>
+          <span class="w-dim" style="font-size:12px">${label}</span>
         </div>`;
     };
 
     const refresh = async () => {
-      if (failed) return;
+      if (destroyed || unavailableReason !== null) return;
       try {
         apply(await ctx.invoke<VolumeState>("volume_get"));
-      } catch {
-        unavailable();
+      } catch (e) {
+        if (destroyed) return;
+        unavailable(classifyIpcUnavailable(e, ["volume_get", "volume_set", "volume_toggle_mute"]) ?? "native");
       }
     };
 
     slider.addEventListener("input", () => {
+      if (destroyed || unavailableReason !== null) return;
       val.textContent = `${slider.value}%`;
-      void ctx.invoke("volume_set", { level: Number(slider.value) / 100 }).catch(() => {
-        val.textContent = "–";
+      void ctx.invoke("volume_set", { level: Number(slider.value) / 100 }).catch((e) => {
+        if (destroyed) return;
+        const reason = classifyIpcUnavailable(e, ["volume_set", "volume_get"]);
+        if (reason) {
+          unavailable(reason);
+        } else {
+          val.textContent = "–";
+        }
       });
     });
 
     muteBtn.addEventListener("click", () => {
+      if (destroyed || unavailableReason !== null) return;
       void (async () => {
         try {
           await ctx.invoke("volume_toggle_mute");
           await refresh();
-        } catch {
-          unavailable();
+        } catch (e) {
+          if (destroyed) return;
+          unavailable(classifyIpcUnavailable(e, ["volume_toggle_mute", "volume_get"]) ?? "native");
         }
       })().catch(() => {});
     });
 
     await refresh();
-    return { refresh };
+    return {
+      refresh,
+      destroy: () => {
+        destroyed = true;
+      },
+    };
   },
 };
 

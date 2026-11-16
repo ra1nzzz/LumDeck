@@ -4,7 +4,9 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
+#[cfg(test)]
+use serde::Serialize;
 use tauri::{AppHandle, PhysicalPosition, PhysicalSize, Window};
 use windows::Win32::Foundation::{ERROR_MORE_DATA, LPARAM, WPARAM};
 use windows::Win32::System::Registry::{
@@ -171,7 +173,8 @@ fn prod_backup_path() -> Result<PathBuf, String> {
         .ok_or_else(|| "APPDATA is unavailable for taskbar backup".into())
 }
 
-#[derive(Serialize, Deserialize)]
+#[cfg_attr(test, derive(Serialize))]
+#[derive(Deserialize)]
 struct TaskbarBackupV1 {
     version: u32,
     checksum: u32,
@@ -190,16 +193,23 @@ fn crc32(data: &[u8]) -> u32 {
     !crc
 }
 
+/// Keep the on-disk `taskbar.bak` payload in the legacy raw `REG_BINARY` format
+/// so a rollback to older LumDeck builds restores the exact original registry
+/// bytes instead of writing a JSON envelope into `StuckRects2\Settings`.
 fn encode_backup(bytes: &[u8]) -> Result<Vec<u8>, String> {
     if bytes.len() < MIN_SETTINGS_LEN || bytes.len() > MAX_SETTINGS_LEN {
         return Err("taskbar state length out of range".into());
     }
-    let payload = TaskbarBackupV1 {
-        version: 1,
-        checksum: crc32(bytes),
-        settings: bytes.to_vec(),
-    };
-    serde_json::to_vec(&payload).map_err(|e| format!("failed to encode taskbar backup: {e}"))
+    if bytes.iter().all(|&b| b == 0) {
+        return Err("taskbar state is all zeros".into());
+    }
+    let all_ascii_text = bytes
+        .iter()
+        .all(|&b| matches!(b, b'\t' | b'\n' | b'\r' | 0x20..=0x7E));
+    if all_ascii_text {
+        return Err("taskbar state is unexpected text payload".into());
+    }
+    Ok(bytes.to_vec())
 }
 
 fn decode_backup(raw: &[u8]) -> Result<Vec<u8>, String> {
@@ -207,7 +217,8 @@ fn decode_backup(raw: &[u8]) -> Result<Vec<u8>, String> {
         return Err("corrupt taskbar backup: empty file".into());
     }
     let first_non_ws = raw.iter().copied().find(|b| !b.is_ascii_whitespace());
-    if first_non_ws == Some(b'{') {
+    // Backward-compatible reader for TaskbarBackupV1 JSON envelopes written by interim builds.
+    if first_non_ws == Some(b'{') && !raw.contains(&0) {
         let parsed: TaskbarBackupV1 = serde_json::from_slice(raw)
             .map_err(|_| "corrupt taskbar backup: malformed json".to_string())?;
         if parsed.version != 1 {
@@ -222,7 +233,7 @@ fn decode_backup(raw: &[u8]) -> Result<Vec<u8>, String> {
         return Ok(parsed.settings);
     }
 
-    // Legacy raw REG_BINARY format compatibility.
+    // Raw REG_BINARY format (legacy and current).
     if raw.len() < MIN_SETTINGS_LEN || raw.len() > MAX_SETTINGS_LEN {
         return Err("corrupt taskbar backup: invalid legacy length".into());
     }
@@ -743,6 +754,49 @@ mod tests {
             assert_eq!(fs::read(env.bak_path()).unwrap(), corrupt);
             assert_eq!(env.reg_bytes(), hidden);
         }
+    }
+
+    #[test]
+    fn new_backup_preserves_raw_binary_for_legacy_rollback_and_reads_v1_json() {
+        let orig = sample_stuck_rects(false);
+        let hidden = sample_stuck_rects(true);
+        let env = FakeEnv::new(orig.clone());
+        let state = Mutex::new(TaskbarState::new());
+        let tx = TaskbarTx { state: &state, env: &env };
+
+        // New backup writes exact raw REG_BINARY bytes so an older build rolling
+        // back can fs::read(taskbar.bak) directly into StuckRects2\Settings.
+        tx.set_autohide(true).unwrap();
+        let legacy_read = fs::read(env.bak_path()).unwrap();
+        assert_eq!(legacy_read, orig);
+
+        // Simulate an older build's heal_taskbar() reading the raw file directly.
+        env.write_registry(&legacy_read).unwrap();
+        assert_eq!(env.reg_bytes(), orig);
+        remove_backup_file(&env.bak_path()).unwrap();
+
+        // Interim v1 JSON envelope backups remain readable and recoverable.
+        *env.reg.lock().unwrap() = hidden.clone();
+        let v1_json = serde_json::to_vec(&TaskbarBackupV1 {
+            version: 1,
+            checksum: crc32(&orig),
+            settings: orig.clone(),
+        })
+        .unwrap();
+        default_write_backup_atomic(&env.bak_path(), &v1_json).unwrap();
+        let heal_state = Mutex::new(TaskbarState::new());
+        let heal_tx = TaskbarTx {
+            state: &heal_state,
+            env: &env,
+        };
+        heal_tx.heal().unwrap();
+        assert_eq!(env.reg_bytes(), orig);
+        assert!(!env.bak_path().exists());
+
+        // Raw binary starting with 0x7B ('{') and containing NULs is not misclassified as JSON.
+        let mut brace_bin = orig.clone();
+        brace_bin[0] = b'{';
+        assert_eq!(decode_backup(&brace_bin).unwrap(), brace_bin);
     }
 
     #[test]

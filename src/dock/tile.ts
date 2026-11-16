@@ -1,7 +1,16 @@
+import {
+  SecretVaultError,
+  createCredentialManager,
+  getWidgetSecretMappings,
+  sanitizeSecretError,
+  stripSecretSettings,
+} from "../core/credentials";
 import { registry } from "../core/registry";
-import { store, type PlacedWidget } from "../core/store";
+import { store, storeCredentialPort, type PlacedWidget } from "../core/store";
 import { invoke } from "../core/tauri";
 import type { SettingsBag, WidgetContext, WidgetInstance } from "../core/types";
+
+export const credentials = createCredentialManager({ store: storeCredentialPort });
 
 /** Build the DOM for one placed widget and mount its module into the body. */
 export function renderTile(placed: PlacedWidget): HTMLElement {
@@ -22,10 +31,6 @@ export function renderTile(placed: PlacedWidget): HTMLElement {
   remove.type = "button";
   remove.textContent = "×";
   remove.title = "Remove";
-  remove.addEventListener("click", (e) => {
-    e.stopPropagation();
-    store.removeWidget(placed.uid);
-  });
   tile.appendChild(remove);
 
   const grip = document.createElement("div");
@@ -33,47 +38,111 @@ export function renderTile(placed: PlacedWidget): HTMLElement {
   grip.title = "Drag to reorder";
   tile.appendChild(grip);
 
+  let disposed = false;
+  let removing = false;
+  let removed = false;
+  let errorBanner: HTMLElement | null = null;
+
+  const setTileError = (msg: string | null) => {
+    if (disposed) return;
+    if (!msg) {
+      errorBanner?.remove();
+      errorBanner = null;
+      remove.title = "Remove";
+      return;
+    }
+    if (!errorBanner) {
+      errorBanner = document.createElement("div");
+      errorBanner.dataset.tileError = "";
+      errorBanner.setAttribute("role", "alert");
+      errorBanner.style.cssText =
+        "position:absolute;inset:auto 4px 3px 4px;padding:2px 5px;border-radius:6px;background:rgba(180,35,35,0.92);color:#fff;font-size:9px;line-height:1.2;z-index:4;pointer-events:none;white-space:nowrap;overflow:hidden;text-overflow:ellipsis";
+      tile.appendChild(errorBanner);
+    }
+    errorBanner.textContent = msg;
+    remove.title = msg;
+  };
+
+  remove.addEventListener("click", (e) => {
+    e.stopPropagation();
+    if (removing || disposed) return;
+    removing = true;
+    remove.disabled = true;
+    setTileError(null);
+
+    void (async () => {
+      const hasSecrets = getWidgetSecretMappings(placed.widgetId).length > 0;
+      if (hasSecrets) {
+        try {
+          await credentials.deleteWidgetSecrets(placed.uid, placed.widgetId);
+        } catch {
+          if (!disposed) {
+            setTileError("Vault delete failed — retry ×");
+            removing = false;
+            remove.disabled = false;
+          }
+          return;
+        }
+      }
+
+      const persisted = store.removeWidget(placed.uid);
+      if (!persisted.ok) {
+        if (!disposed) {
+          setTileError(
+            hasSecrets
+              ? "Secret cleared; layout save failed — retry ×"
+              : "Layout save failed — retry ×",
+          );
+          removing = false;
+          remove.disabled = false;
+        }
+        return;
+      }
+
+      removed = true;
+      if (!disposed) {
+        removing = false;
+        remove.disabled = false;
+      }
+    })();
+  });
+
   if (!mod) {
     body.innerHTML = `<div class="w-error">missing<br>${escapeHtml(placed.widgetId)}</div>`;
+    (tile as unknown as { __destroy?: () => void }).__destroy = () => {
+      disposed = true;
+    };
     return tile;
   }
 
-  const settings: SettingsBag = { ...placed.settings };
+  // Initialize cancellable lifecycle before scheduling mount so synchronous
+  // unmount before the microtask prevents mount() from ever running.
+  const mountAbort = new AbortController();
+  const settings: SettingsBag = stripSecretSettings(placed.widgetId, placed.settings);
   const subs = new Set<(s: SettingsBag) => void>();
+  const secretHandle = credentials.forWidget(placed.uid, placed.widgetId);
   const ctx: WidgetContext = {
     invoke,
     uid: placed.uid,
+    signal: mountAbort.signal,
     settings,
     setSettings: (patch) => {
-      Object.assign(settings, patch);
+      const cleanPatch = stripSecretSettings(placed.widgetId, patch);
+      Object.assign(settings, cleanPatch);
       const snapshot = { ...settings };
       store.setWidgetSettings(placed.uid, snapshot);
       for (const h of subs) h(snapshot);
     },
-    // Secrets live in the OS credential vault, namespaced per instance, and are
-    // never written to localStorage. These resolve (not reject) when the backend
-    // is unavailable so widgets keep rendering in a plain browser during dev.
-    setSecret: async (key, value) => {
-      try {
-        await invoke("cred_set", { key: `${placed.uid}:${key}`, secret: value });
-      } catch (e) {
-        console.warn(`[secret] set "${key}" failed`, e);
+    setSecret: (key, value) => {
+      if (disposed || removing || removed) {
+        return Promise.reject(
+          new SecretVaultError("widget_deleted", "Cannot save credential for a removed widget"),
+        );
       }
+      return secretHandle.setSecret(key, value);
     },
-    getSecret: async (key) => {
-      try {
-        return await invoke<string | null>("cred_get", { key: `${placed.uid}:${key}` });
-      } catch {
-        return null;
-      }
-    },
-    deleteSecret: async (key) => {
-      try {
-        await invoke("cred_delete", { key: `${placed.uid}:${key}` });
-      } catch (e) {
-        console.warn(`[secret] delete "${key}" failed`, e);
-      }
-    },
+    getSecret: (key) => secretHandle.getSecret(key),
+    deleteSecret: (key) => secretHandle.deleteSecret(key),
     onSettings: (h) => {
       subs.add(h);
       return () => subs.delete(h);
@@ -82,51 +151,67 @@ export function renderTile(placed: PlacedWidget): HTMLElement {
 
   let instance: WidgetInstance | undefined;
   let timer = 0;
-  let disposed = false;
+  let instanceDestroyed = false;
+
+  const destroyInstanceOnce = (inst: WidgetInstance | undefined): void => {
+    if (!inst || instanceDestroyed) return;
+    instanceDestroyed = true;
+    try {
+      inst.destroy?.();
+    } catch {
+      /* ignore */
+    }
+  };
+
+  const scheduleNextRefresh = (): void => {
+    if (disposed || mountAbort.signal.aborted) return;
+    if (!mod.refreshMs || mod.refreshMs <= 0 || !instance?.refresh) return;
+    timer = window.setTimeout(async () => {
+      timer = 0;
+      if (disposed || mountAbort.signal.aborted) return;
+      try {
+        await instance?.refresh?.();
+      } catch {
+        /* a throwing refresh must not kill the refresh loop */
+      } finally {
+        scheduleNextRefresh();
+      }
+    }, mod.refreshMs);
+  };
 
   Promise.resolve()
-    .then(() => mod.mount(body, ctx))
+    .then(() => {
+      if (disposed || mountAbort.signal.aborted) return undefined;
+      return mod.mount(body, ctx);
+    })
     .then((inst) => {
+      if (!inst) return;
       // A layout change may have destroyed this tile while mount() was still
-      // pending; if so, tear the late instance down and never start a timer on
-      // a detached node.
-      if (disposed) {
-        try {
-          inst?.destroy?.();
-        } catch {
-          /* ignore */
-        }
+      // pending; tear the late instance down once and never start a timer.
+      if (disposed || mountAbort.signal.aborted) {
+        destroyInstanceOnce(inst);
         return;
       }
       instance = inst;
-      if (mod.refreshMs && mod.refreshMs > 0) {
-        timer = window.setInterval(() => {
-          try {
-            const r = instance?.refresh?.();
-            if (r && typeof (r as Promise<void>).catch === "function") {
-              (r as Promise<void>).catch(() => {});
-            }
-          } catch {
-            /* a throwing refresh must not kill the interval loop */
-          }
-        }, mod.refreshMs);
-      }
+      scheduleNextRefresh();
     })
     .catch((err) => {
-      if (disposed) return;
-      console.error(`[widget:${mod.id}] mount failed`, err);
+      if (disposed || mountAbort.signal.aborted) return;
+      console.error(`[widget:${mod.id}] mount failed`, sanitizeSecretError(err));
       body.innerHTML = `<div class="w-error">failed to load</div>`;
     });
 
   // Cleanup hook used by the dock on structural re-render.
+  // Temporary unmount or reorder never deletes Vault credentials.
   (tile as unknown as { __destroy?: () => void }).__destroy = () => {
+    if (disposed) return;
     disposed = true;
-    if (timer) clearInterval(timer);
-    try {
-      instance?.destroy?.();
-    } catch {
-      /* ignore */
+    if (timer) {
+      clearTimeout(timer);
+      timer = 0;
     }
+    mountAbort.abort();
+    destroyInstanceOnce(instance);
   };
 
   return tile;

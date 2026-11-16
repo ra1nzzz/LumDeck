@@ -58,6 +58,13 @@ fn validate_web_url(raw: &str) -> Result<String, String> {
         return Err("url contains control characters".into());
     }
 
+    if let Some((_, after_scheme)) = trimmed.split_once("://") {
+        let raw_authority = after_scheme.split(['/', '?', '#']).next().unwrap_or("");
+        if raw_authority.contains('@') {
+            return Err("url must not contain credentials".into());
+        }
+    }
+
     let parsed = Url::parse(trimmed).map_err(|e| format!("invalid url: {e}"))?;
     if !matches!(parsed.scheme(), "http" | "https") {
         return Err(format!("unsupported url scheme: {}", parsed.scheme()));
@@ -72,7 +79,7 @@ fn validate_web_url(raw: &str) -> Result<String, String> {
         return Err("url must not contain credentials".into());
     }
 
-    let canonical = parsed.into_string();
+    let canonical = String::from(parsed);
     if canonical.contains('\0') {
         return Err("url contains NUL byte".into());
     }

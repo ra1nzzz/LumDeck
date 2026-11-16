@@ -108,10 +108,10 @@ describe("revenue call layer", () => {
     const ctx = makeCtx({ getSecret: vi.fn(async () => "sk_test") });
     const now = Math.floor(Date.now() / 1000);
     const charges = [
-      { amount: 1000, amount_refunded: 0, currency: "usd", status: "succeeded", created: now - 3600 },
-      { amount: 2500, amount_refunded: 500, currency: "usd", status: "succeeded", created: now - 7200 },
-      { amount: 9999, currency: "usd", status: "failed", created: now - 60 }, // excluded
-      { amount: 5000, currency: "usd", status: "succeeded", created: now - 999_999_999 }, // >30d, excluded
+      { id: "ch_1", amount: 1000, amount_captured: 1000, amount_refunded: 0, currency: "usd", status: "succeeded", created: now - 3600 },
+      { id: "ch_2", amount: 2500, amount_captured: 2500, amount_refunded: 500, currency: "usd", status: "succeeded", created: now - 7200 },
+      { id: "ch_3", amount: 9999, amount_captured: 0, amount_refunded: 0, currency: "usd", status: "failed", created: now - 60 }, // excluded
+      { id: "ch_4", amount: 5000, amount_captured: 5000, amount_refunded: 0, currency: "usd", status: "succeeded", created: now - 999_999_999 }, // >30d, excluded
     ];
     let auth = "";
     vi.stubGlobal(

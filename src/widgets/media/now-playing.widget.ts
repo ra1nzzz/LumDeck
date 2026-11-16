@@ -1,3 +1,4 @@
+import { classifyIpcUnavailable, type IpcUnavailableReason } from "../../core/tauri";
 import type { WidgetModule } from "../../core/types";
 import { icons } from "../icons";
 
@@ -18,22 +19,10 @@ type State =
   | { kind: "track"; track: Track }
   | { kind: "empty" }
   | { kind: "error" }
-  | { kind: "unavailable" };
+  | { kind: "unavailable"; reason: IpcUnavailableReason };
 
 const str = (v: unknown): string => (typeof v === "string" ? v : v == null ? "" : String(v));
 const bool = (v: unknown): boolean => v === true;
-
-const errText = (e: unknown): string => (e instanceof Error && e.message ? e.message : String(e));
-
-/** True when the invoke rejected because the command isn't registered in this build. */
-const isCommandMissing = (e: unknown): boolean => {
-  const msg = errText(e).toLowerCase();
-  return (
-    msg.includes("not found") ||
-    msg.includes("now_playing") ||
-    msg.includes("media_control")
-  );
-};
 
 function setText(el: HTMLElement, text: string): void {
   el.textContent = text;
@@ -93,7 +82,7 @@ const mod: WidgetModule = {
     const nextBtn = body.querySelector<HTMLButtonElement>("[data-next]")!;
 
     const anims = [...eq.querySelectorAll<HTMLElement>("i")].map((bar, i) =>
-      bar.animate(
+      bar.animate?.(
         [
           { transform: "scaleY(0.25)" },
           { transform: "scaleY(1)" },
@@ -108,7 +97,17 @@ const mod: WidgetModule = {
       ),
     );
 
+    let destroyed = false;
+    let unavailableReason: IpcUnavailableReason | null = null;
+
+    const disableControls = () => {
+      prevBtn.disabled = true;
+      toggleBtn.disabled = true;
+      nextBtn.disabled = true;
+    };
+
     const render = (state: State) => {
+      if (destroyed) return;
       if (state.kind === "track") {
         const t = state.track;
         offView.style.display = "none";
@@ -123,8 +122,15 @@ const mod: WidgetModule = {
         onView.style.display = "none";
         offView.style.display = "flex";
         if (state.kind === "unavailable") {
-          setText(mainEl, "Now Playing · not available in this build");
-          setText(sub, "The backend command isn't wired up in this build.");
+          disableControls();
+          for (const a of anims) a?.cancel();
+          if (state.reason === "preview") {
+            setText(mainEl, "Now Playing · browser preview");
+            setText(sub, "Media controls require the LumDeck desktop app.");
+          } else {
+            setText(mainEl, "Now Playing · not available in this build");
+            setText(sub, "Native media commands aren't registered in this build.");
+          }
         } else {
           setText(mainEl, "Nothing playing");
           setText(sub, state.kind === "error" ? "unavailable" : "");
@@ -133,7 +139,7 @@ const mod: WidgetModule = {
     };
 
     const flash = (el: HTMLElement) => {
-      el.animate(
+      el.animate?.(
         [
           { color: "var(--bad)" },
           { color: "var(--bad)", offset: 0.6 },
@@ -144,8 +150,10 @@ const mod: WidgetModule = {
     };
 
     const refresh = async () => {
+      if (destroyed || unavailableReason !== null) return;
       try {
         const raw = await ctx.invoke<Track | null>("now_playing");
+        if (destroyed || unavailableReason !== null) return;
         if (!raw) {
           render({ kind: "empty" });
           return;
@@ -161,22 +169,38 @@ const mod: WidgetModule = {
           track: { title, artist, source: str(raw.source), playing: bool(raw.playing) },
         });
       } catch (e) {
-        render(isCommandMissing(e) ? { kind: "unavailable" } : { kind: "error" });
+        if (destroyed) return;
+        const reason = classifyIpcUnavailable(e, ["now_playing", "media_control"]);
+        if (reason) {
+          unavailableReason = reason;
+          render({ kind: "unavailable", reason });
+          return;
+        }
+        render({ kind: "error" });
       }
     };
 
     const control = async (action: "prev" | "toggle" | "next", btn: HTMLButtonElement) => {
-      if (btn.disabled) return;
+      if (destroyed || unavailableReason !== null || btn.disabled) return;
       btn.disabled = true;
       btn.style.opacity = "0.55";
       try {
         await ctx.invoke("media_control", { action });
-        void refresh();
-      } catch {
+        if (!destroyed && unavailableReason === null) void refresh();
+      } catch (e) {
+        if (destroyed) return;
+        const reason = classifyIpcUnavailable(e, ["media_control", "now_playing"]);
+        if (reason) {
+          unavailableReason = reason;
+          render({ kind: "unavailable", reason });
+          return;
+        }
         flash(btn);
       } finally {
-        btn.disabled = false;
-        btn.style.opacity = "";
+        if (!destroyed && unavailableReason === null) {
+          btn.disabled = false;
+          btn.style.opacity = "";
+        }
       }
     };
 
@@ -188,7 +212,8 @@ const mod: WidgetModule = {
     return {
       refresh,
       destroy() {
-        for (const a of anims) a.cancel();
+        destroyed = true;
+        for (const a of anims) a?.cancel();
         styleEl.remove();
       },
     };
