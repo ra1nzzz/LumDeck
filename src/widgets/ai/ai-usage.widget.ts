@@ -105,12 +105,17 @@ const mod: WidgetModule = {
   refreshMs: 60000,
   async mount(body, ctx) {
     let provider: ProviderId = isProvider(ctx.settings.provider) ? ctx.settings.provider : "claude";
+    let sessionKey = "";
+    try {
+      sessionKey = ((await ctx.getSecret("sessionKey")) ?? "").trim();
+    } catch {
+      sessionKey = "";
+    }
     let view: "main" | "connect" | "unavailable" = "main";
     let busy = false;
     let note = "";
 
     const def = (): ProviderDef => PROVIDERS.find((p) => p.id === provider) ?? PROVIDERS[0];
-    const sessionKey = (): string => asString(ctx.settings.sessionKey);
     const connected = (): boolean => ctx.settings.connected === true;
 
     const windowRowHtml = (key: string, label: string): string => `
@@ -241,11 +246,13 @@ const mod: WidgetModule = {
       if (view === "connect") {
         const input = body.querySelector<HTMLInputElement>("[data-token]");
         const connect = body.querySelector<HTMLButtonElement>("[data-connect]");
-        const save = () => {
-          const patch: Record<string, unknown> = { connected: true };
+        const save = async () => {
           const key = input?.value.trim() ?? "";
-          if (key) patch.sessionKey = key;
-          ctx.setSettings(patch);
+          if (key) {
+            sessionKey = key;
+            await ctx.setSecret("sessionKey", key);
+          }
+          ctx.setSettings({ connected: true });
           view = "main";
           render();
           void refresh();
@@ -268,8 +275,7 @@ const mod: WidgetModule = {
       paintPending();
       try {
         const args: Record<string, unknown> = { provider };
-        const key = sessionKey();
-        if (key) args.sessionKey = key;
+        if (sessionKey) args.sessionKey = sessionKey;
         const raw = await ctx.invoke<unknown>("ai_usage", args);
         const data = rec(raw);
         if (!Object.keys(data).length) throw new Error("no usage data");

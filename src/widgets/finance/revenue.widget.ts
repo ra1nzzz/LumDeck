@@ -160,8 +160,13 @@ const mod: WidgetModule = {
   icon: icons.trend,
   defaultSize: { w: 3, h: 1 },
   refreshMs: 900000,
-  mount(body, ctx) {
-    let key = typeof ctx.settings.apiKey === "string" ? ctx.settings.apiKey.trim() : "";
+  async mount(body, ctx) {
+    let key = "";
+    try {
+      key = ((await ctx.getSecret("apiKey")) ?? "").trim();
+    } catch {
+      key = "";
+    }
     let gen = 0;
     let inFlight = false;
     let queued = false;
@@ -275,14 +280,14 @@ const mod: WidgetModule = {
       }
     };
 
-    const save = () => {
+    const save = async () => {
       const next = keyIn.value.trim();
       if (!next) {
         msgEl.textContent = "Paste a Stripe secret key (sk_…)";
         return;
       }
       key = next;
-      ctx.setSettings({ apiKey: next });
+      await ctx.setSecret("apiKey", next);
       msgEl.textContent = "";
       void load();
     };
@@ -290,18 +295,6 @@ const mod: WidgetModule = {
     saveBtn.addEventListener("click", save);
     keyIn.addEventListener("keydown", (e) => {
       if ((e as KeyboardEvent).key === "Enter") save();
-    });
-
-    const off = ctx.onSettings((s) => {
-      const next = typeof s.apiKey === "string" ? s.apiKey.trim() : "";
-      if (next === key) return;
-      key = next;
-      if (!key) {
-        msgEl.textContent = "";
-        show("connect");
-      } else {
-        void load();
-      }
     });
 
     if (key) {
@@ -317,7 +310,6 @@ const mod: WidgetModule = {
         destroyed = true;
         ac?.abort();
         ac = null;
-        off();
       },
     };
   },

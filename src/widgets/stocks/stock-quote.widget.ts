@@ -43,9 +43,14 @@ const mod: WidgetModule = {
   icon: icons.trend,
   defaultSize: { w: 2, h: 1 },
   refreshMs: 60000,
-  mount(body, ctx) {
+  async mount(body, ctx) {
     let symbol = asString(ctx.settings.symbol, "AAPL").toUpperCase();
-    let apiKey = asString(ctx.settings.apiKey, "");
+    let apiKey = "";
+    try {
+      apiKey = ((await ctx.getSecret("apiKey")) ?? "").trim();
+    } catch {
+      apiKey = "";
+    }
     let loading = false;
     let token = 0;
     let ac: AbortController | null = null;
@@ -150,17 +155,26 @@ const mod: WidgetModule = {
 
       if (apiKey) {
         el<HTMLButtonElement>("[data-key]").addEventListener("click", () => {
-          ctx.setSettings({ apiKey: "" });
+          void (async () => {
+            apiKey = "";
+            await ctx.deleteSecret("apiKey");
+            render();
+          })();
         });
       } else {
         const keyInput = el<HTMLInputElement>("[data-key-input]");
-        const save = () => {
+        const save = async () => {
           const nextKey = keyInput.value.trim();
           const nextSym = symInput.value.trim().toUpperCase();
           if (!nextKey) return;
-          const patch: Record<string, unknown> = { apiKey: nextKey };
-          if (nextSym) patch.symbol = nextSym;
-          ctx.setSettings(patch);
+          apiKey = nextKey;
+          await ctx.setSecret("apiKey", nextKey);
+          if (nextSym) {
+            symbol = nextSym;
+            ctx.setSettings({ symbol: nextSym });
+          }
+          render();
+          void refresh();
         };
         el<HTMLButtonElement>("[data-save]").addEventListener("click", save);
         keyInput.addEventListener("keydown", (e) => {
@@ -180,12 +194,10 @@ const mod: WidgetModule = {
 
     const unsub = ctx.onSettings((s) => {
       const nextSym = asString(s.symbol, "AAPL").toUpperCase();
-      const nextKey = asString(s.apiKey, "");
-      const changedKey = nextKey !== apiKey;
+      if (nextSym === symbol) return;
       symbol = nextSym;
-      apiKey = nextKey;
       render();
-      if (changedKey) void refresh();
+      void refresh();
     });
 
     render();

@@ -34,10 +34,12 @@ const mod: WidgetModule = {
   defaultSize: { w: 2, h: 1 },
   refreshMs: 120000,
   async mount(body, ctx) {
-    const token = () => {
-      const t = ctx.settings.accessToken;
-      return typeof t === "string" ? t.trim() : "";
-    };
+    let token = "";
+    try {
+      token = ((await ctx.getSecret("accessToken")) ?? "").trim();
+    } catch {
+      token = "";
+    }
 
     const mainHtml = `
       <div class="w-row" style="justify-content:space-between;height:100%;gap:4px">
@@ -63,7 +65,7 @@ const mod: WidgetModule = {
         ${hint ? `<div class="w-error">${hint}</div>` : ""}
       </div>`;
 
-    let view: "main" | "connect" = "main";
+    let view: "" | "main" | "connect" = "";
     let ac: AbortController | null = null;
     let busy = false;
 
@@ -80,9 +82,13 @@ const mod: WidgetModule = {
       view = "connect";
       body.innerHTML = connectHtml(hint);
       const input = body.querySelector<HTMLInputElement>("[data-token]")!;
-      const save = () => {
+      const save = async () => {
         const value = input.value.trim();
-        if (value) ctx.setSettings({ accessToken: value });
+        if (!value) return;
+        token = value;
+        await ctx.setSecret("accessToken", value);
+        showMain();
+        void refresh();
       };
       body.querySelector<HTMLButtonElement>("[data-save]")!.addEventListener("click", save);
       input.addEventListener("keydown", (e) => {
@@ -98,7 +104,7 @@ const mod: WidgetModule = {
     };
 
     const refresh = async () => {
-      const t = token();
+      const t = token;
       if (!t) {
         showConnect("");
         return;
@@ -133,16 +139,7 @@ const mod: WidgetModule = {
       }
     };
 
-    const offSettings = ctx.onSettings(() => {
-      if (token() && view === "connect") {
-        showMain();
-        void refresh();
-      } else if (!token() && view === "main") {
-        showConnect("");
-      }
-    });
-
-    if (token()) {
+    if (token) {
       showMain();
       await refresh();
     } else {
@@ -154,7 +151,6 @@ const mod: WidgetModule = {
       destroy: () => {
         ac?.abort();
         ac = null;
-        offSettings();
       },
     };
   },

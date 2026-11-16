@@ -4,8 +4,8 @@ import { icons } from "../icons";
 const ico = (svg: string, px = 12) =>
   `<span class="w-icon" style="width:${px}px;height:${px}px">${svg}</span>`;
 
-const dayKey = () => {
-  const d = new Date();
+const dayKey = (now = Date.now()) => {
+  const d = new Date(now);
   return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
 };
 
@@ -69,6 +69,7 @@ const mod: WidgetModule = {
         window.clearInterval(timer);
         timer = undefined;
       }
+      endAt = 0;
     };
 
     const render = () => {
@@ -81,36 +82,45 @@ const mod: WidgetModule = {
       toggleBtn.innerHTML = running ? `${ico(icons.pause)}Pause` : `${ico(icons.play)}Start`;
     };
 
-    const tick = () => {
-      const key = dayKey();
+    // Settle against the active deadline before pausing or rendering so early pauses
+    // retain elapsed time and late pauses/ticks count the completed phase once.
+    const settle = (now = Date.now()) => {
+      const key = dayKey(now);
       if (key !== countDate) {
         countDate = key;
         count = 0;
       }
-      if (running) {
-        remaining = endAt - Date.now();
-        if (remaining <= 0) {
-          if (mode === "work") {
-            count += 1;
-            ctx.setSettings({ count, date: key });
-          }
-          mode = mode === "work" ? "break" : "work";
-          phaseMs = (mode === "work" ? workMin : breakMin) * 60000;
-          remaining = phaseMs;
-          endAt = Date.now() + remaining;
+      if (!running) return;
+      remaining = endAt - now;
+      if (remaining <= 0) {
+        if (mode === "work") {
+          count += 1;
+          ctx.setSettings({ count, date: key });
         }
+        mode = mode === "work" ? "break" : "work";
+        phaseMs = (mode === "work" ? workMin : breakMin) * 60000;
+        remaining = phaseMs;
+        endAt = now + remaining;
       }
+    };
+
+    const tick = () => {
+      settle();
       render();
     };
 
     const toggle = () => {
+      const now = Date.now();
       if (running) {
+        settle(now);
         running = false;
         stopTimer();
       } else {
+        settle(now);
         if (remaining <= 0) remaining = phaseMs;
         running = true;
-        endAt = Date.now() + remaining;
+        endAt = now + remaining;
+        if (timer !== undefined) window.clearInterval(timer);
         timer = window.setInterval(tick, 250);
       }
       render();
@@ -144,7 +154,12 @@ const mod: WidgetModule = {
     brkInput.addEventListener("change", applyDurations);
 
     render();
-    return { destroy: stopTimer };
+    return {
+      destroy: () => {
+        running = false;
+        stopTimer();
+      },
+    };
   },
 };
 

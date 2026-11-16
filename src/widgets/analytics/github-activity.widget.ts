@@ -9,7 +9,7 @@ const refreshIcon =
 /** Read the `rel="last"` page number from a GitHub Link header, if present. */
 function parseLastPage(link: string | null): number | null {
   if (!link) return null;
-  const m = link.match(/page=(\d+)[^>]*>;\s*rel="last"/);
+  const m = link.match(/[?&]page=(\d+)[^>]*>;\s*rel="last"/);
   return m ? Number(m[1]) : null;
 }
 
@@ -21,13 +21,15 @@ const mod: WidgetModule = {
   icon: githubIcon,
   defaultSize: { w: 2, h: 1 },
   refreshMs: 120000,
-  mount(body, ctx) {
-    const readToken = () =>
-      typeof ctx.settings.token === "string" ? (ctx.settings.token as string).trim() : "";
-    let token = readToken();
+  async mount(body, ctx) {
+    let token = "";
+    try {
+      token = ((await ctx.getSecret("token")) ?? "").trim();
+    } catch {
+      token = "";
+    }
 
     let abort: AbortController | null = null;
-    let offSettings: (() => void) | null = null;
 
     const renderConnect = () => {
       body.innerHTML = `
@@ -47,7 +49,7 @@ const mod: WidgetModule = {
         const v = input.value.trim();
         if (!v) return;
         token = v;
-        ctx.setSettings({ token: v });
+        void ctx.setSecret("token", v);
         route();
       };
       save.addEventListener("click", doSave);
@@ -148,21 +150,12 @@ const mod: WidgetModule = {
       }
     };
 
-    offSettings = ctx.onSettings((s) => {
-      const t = typeof s.token === "string" ? (s.token as string).trim() : "";
-      if (t !== token) {
-        token = t;
-        route();
-      }
-    });
-
     route();
 
     return {
       refresh,
       destroy: () => {
         if (abort) abort.abort();
-        if (offSettings) offSettings();
       },
     };
   },

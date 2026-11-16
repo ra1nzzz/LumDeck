@@ -42,12 +42,37 @@ export function renderTile(placed: PlacedWidget): HTMLElement {
   const subs = new Set<(s: SettingsBag) => void>();
   const ctx: WidgetContext = {
     invoke,
+    uid: placed.uid,
     settings,
     setSettings: (patch) => {
       Object.assign(settings, patch);
       const snapshot = { ...settings };
       store.setWidgetSettings(placed.uid, snapshot);
       for (const h of subs) h(snapshot);
+    },
+    // Secrets live in the OS credential vault, namespaced per instance, and are
+    // never written to localStorage. These resolve (not reject) when the backend
+    // is unavailable so widgets keep rendering in a plain browser during dev.
+    setSecret: async (key, value) => {
+      try {
+        await invoke("cred_set", { key: `${placed.uid}:${key}`, secret: value });
+      } catch (e) {
+        console.warn(`[secret] set "${key}" failed`, e);
+      }
+    },
+    getSecret: async (key) => {
+      try {
+        return await invoke<string | null>("cred_get", { key: `${placed.uid}:${key}` });
+      } catch {
+        return null;
+      }
+    },
+    deleteSecret: async (key) => {
+      try {
+        await invoke("cred_delete", { key: `${placed.uid}:${key}` });
+      } catch (e) {
+        console.warn(`[secret] delete "${key}" failed`, e);
+      }
     },
     onSettings: (h) => {
       subs.add(h);

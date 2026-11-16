@@ -25,10 +25,23 @@ export type SettingsBag = Record<string, unknown>;
 export interface WidgetContext {
   /** Call a Tauri command. Rejects with a normal Error on failure. */
   invoke: <T = unknown>(cmd: string, args?: Record<string, unknown>) => Promise<T>;
-  /** Current persisted settings for this widget instance. */
+  /** This placed instance's stable id (use it to namespace secrets). */
+  readonly uid: string;
+  /** Current persisted NON-secret settings for this widget instance. */
   readonly settings: SettingsBag;
-  /** Patch and persist settings for this widget instance. */
+  /** Merge + persist NON-secret settings for this widget instance. */
   setSettings: (patch: SettingsBag) => void;
+  /**
+   * Store a SECRET (API key / token / OAuth token) in the OS credential vault
+   * (Windows Credential Manager via the Rust backend), namespaced to this
+   * instance. NEVER persist secrets via setSettings — that lands in plaintext
+   * localStorage. Resolves even when the backend is unavailable (dev/browser).
+   */
+  setSecret: (key: string, value: string) => Promise<void>;
+  /** Read a previously stored secret, or null if absent/unavailable. */
+  getSecret: (key: string) => Promise<string | null>;
+  /** Remove a stored secret. */
+  deleteSecret: (key: string) => Promise<void>;
   /** Subscribe to settings changes (including external). Returns an unsubscribe fn. */
   onSettings: (handler: (settings: SettingsBag) => void) => () => void;
 }

@@ -20,42 +20,54 @@ function clone(cities: City[]): City[] {
 }
 
 function loadCities(raw: unknown): City[] {
+  // Preserve an explicit saved array (including []) and only seed defaults when unset/invalid.
+  if (!Array.isArray(raw)) return clone(DEFAULTS);
   const out: City[] = [];
-  if (Array.isArray(raw)) {
-    for (const item of raw) {
-      if (out.length >= MAX_CITIES) break;
-      if (!item || typeof item !== "object") continue;
-      const o = item as { name?: unknown; tz?: unknown };
-      const name = typeof o.name === "string" ? o.name.trim() : "";
-      const tz = typeof o.tz === "string" ? o.tz.trim() : "";
-      if (name && tz) out.push({ name, tz });
-    }
+  for (const item of raw) {
+    if (out.length >= MAX_CITIES) break;
+    if (!item || typeof item !== "object") continue;
+    const o = item as { name?: unknown; tz?: unknown };
+    const name = typeof o.name === "string" ? o.name.trim() : "";
+    const tz = typeof o.tz === "string" ? o.tz.trim() : "";
+    if (name && tz) out.push({ name, tz });
   }
-  return out.length ? out : clone(DEFAULTS);
+  return out;
 }
 
-function validTz(tz: string): boolean {
+interface TzFormatters {
+  time: Intl.DateTimeFormat;
+  date: Intl.DateTimeFormat;
+}
+
+function createTzFormatters(tz: string): TzFormatters | null {
   try {
-    new Intl.DateTimeFormat("en-GB", { timeZone: tz, hourCycle: "h23" });
-    return true;
+    return {
+      time: new Intl.DateTimeFormat("en-GB", {
+        timeZone: tz,
+        hour: "2-digit",
+        minute: "2-digit",
+        hourCycle: "h23",
+      }),
+      date: new Intl.DateTimeFormat("en-CA", { timeZone: tz }),
+    };
   } catch {
-    return false;
+    return null;
   }
 }
 
-/** Local wall-clock time + day offset for a time zone. Never throws. */
-function cityTime(tz: string, now: Date): { time: string; day: string; ok: boolean } {
+/** Local wall-clock time + day offset using cached formatters and precomputed local day. Never throws. */
+function cityTime(
+  fmts: TzFormatters | null,
+  now: Date,
+  localDay: number,
+): { time: string; day: string; ok: boolean } {
   const fallback = { time: "–", day: "", ok: false };
+  if (!fmts) return fallback;
   try {
-    const time = new Intl.DateTimeFormat("en-GB", {
-      timeZone: tz,
-      hour: "2-digit",
-      minute: "2-digit",
-      hourCycle: "h23",
-    }).format(now);
-    const local = Date.parse(new Intl.DateTimeFormat("en-CA").format(now));
-    const remote = Date.parse(new Intl.DateTimeFormat("en-CA", { timeZone: tz }).format(now));
-    const diff = Math.round((remote - local) / DAY_MS);
+    const time = fmts.time.format(now);
+    const remote = Date.parse(fmts.date.format(now));
+    if (!Number.isFinite(remote)) return fallback;
+    const diff = Math.round((remote - localDay) / DAY_MS);
     const day = diff === 0 ? "" : diff > 0 ? `+${diff}d` : `${diff}d`;
     return { time, day, ok: true };
   } catch {
@@ -103,18 +115,41 @@ const mod: WidgetModule = {
 
     interface Row {
       tz: string;
+      fmts: TzFormatters | null;
       time: HTMLElement;
       day: HTMLElement;
+      lastTime: string;
+      lastDay: string;
+      lastOk: boolean;
     }
     let rows: Row[] = [];
+    const tzCache = new Map<string, TzFormatters>();
+
+    const getFormatters = (tz: string): TzFormatters | null => {
+      const cached = tzCache.get(tz);
+      if (cached) return cached;
+      const created = createTzFormatters(tz);
+      if (created) tzCache.set(tz, created);
+      return created;
+    };
 
     const tick = () => {
       const now = new Date();
+      const localDay = Date.UTC(now.getFullYear(), now.getMonth(), now.getDate());
       for (const r of rows) {
-        const t = cityTime(r.tz, now);
-        r.time.textContent = t.time;
-        r.day.textContent = t.day;
-        r.time.style.color = t.ok ? "" : "var(--bad)";
+        const t = cityTime(r.fmts, now, localDay);
+        if (t.time !== r.lastTime) {
+          r.time.textContent = t.time;
+          r.lastTime = t.time;
+        }
+        if (t.day !== r.lastDay) {
+          r.day.textContent = t.day;
+          r.lastDay = t.day;
+        }
+        if (t.ok !== r.lastOk) {
+          r.time.style.color = t.ok ? "" : "var(--bad)";
+          r.lastOk = t.ok;
+        }
       }
     };
 
@@ -123,6 +158,11 @@ const mod: WidgetModule = {
     };
 
     const renderRows = () => {
+      const activeTzs = new Set(cities.map((c) => c.tz));
+      for (const tz of tzCache.keys()) {
+        if (!activeTzs.has(tz)) tzCache.delete(tz);
+      }
+
       list.innerHTML = "";
       rows = cities.map((c) => {
         const row = document.createElement("div");
@@ -159,7 +199,15 @@ const mod: WidgetModule = {
 
         row.append(name, day, time, del);
         list.appendChild(row);
-        return { tz: c.tz, time, day };
+        return {
+          tz: c.tz,
+          fmts: getFormatters(c.tz),
+          time,
+          day,
+          lastTime: "--:--",
+          lastDay: "",
+          lastOk: true,
+        };
       });
       addBtn.disabled = cities.length >= MAX_CITIES;
       tick();
@@ -188,7 +236,8 @@ const mod: WidgetModule = {
         showError("Enter a time zone, e.g. Europe/Paris");
         return;
       }
-      if (!validTz(tz)) {
+      const fmts = tzCache.get(tz) ?? createTzFormatters(tz);
+      if (!fmts) {
         showError("Unknown time zone");
         return;
       }
@@ -196,6 +245,7 @@ const mod: WidgetModule = {
         showError(`Up to ${MAX_CITIES} cities`);
         return;
       }
+      tzCache.set(tz, fmts);
       cities = [...cities, { name, tz }];
       persist();
       renderRows();
@@ -233,6 +283,8 @@ const mod: WidgetModule = {
       refresh: tick,
       destroy: () => {
         unsub();
+        tzCache.clear();
+        rows = [];
       },
     };
   },

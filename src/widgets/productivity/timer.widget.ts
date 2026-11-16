@@ -60,6 +60,7 @@ const mod: WidgetModule = {
         window.clearInterval(timer);
         timer = undefined;
       }
+      endAt = 0;
     };
 
     const render = () => {
@@ -74,28 +75,40 @@ const mod: WidgetModule = {
         : `${ico(icons.play)}${done ? "Again" : "Start"}`;
     };
 
-    const tick = () => {
-      remaining = endAt - Date.now();
+    // Settle elapsed time against the active deadline before ticking or pausing so
+    // early pauses and late event-loop wakes preserve exact remaining time and finish once.
+    const settle = (now = Date.now()) => {
+      if (!running) return;
+      remaining = endAt - now;
       if (remaining <= 0) {
         remaining = 0;
         running = false;
         done = true;
         stopTimer();
       }
+    };
+
+    const tick = () => {
+      settle();
       render();
     };
 
     const toggle = () => {
+      const now = Date.now();
       if (running) {
-        running = false;
-        stopTimer();
+        settle(now);
+        if (running) {
+          running = false;
+          stopTimer();
+        }
       } else {
         if (done || remaining <= 0) {
           remaining = totalMs;
           done = false;
         }
         running = true;
-        endAt = Date.now() + remaining;
+        endAt = now + remaining;
+        if (timer !== undefined) window.clearInterval(timer);
         timer = window.setInterval(tick, 200);
       }
       render();
@@ -128,6 +141,7 @@ const mod: WidgetModule = {
     render();
     return {
       destroy() {
+        running = false;
         stopTimer();
         styleEl.remove();
       },

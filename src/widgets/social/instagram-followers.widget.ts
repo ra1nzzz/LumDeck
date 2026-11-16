@@ -37,8 +37,13 @@ const mod: WidgetModule = {
   icon: igIcon,
   defaultSize: { w: 2, h: 1 },
   refreshMs: 300000,
-  mount(body, ctx) {
-    let accessToken = asString(ctx.settings.accessToken);
+  async mount(body, ctx) {
+    let accessToken = "";
+    try {
+      accessToken = ((await ctx.getSecret("accessToken")) ?? "").trim();
+    } catch {
+      accessToken = "";
+    }
     let userId = asString(ctx.settings.userId);
     let username = "";
     let rejected = false;
@@ -114,7 +119,12 @@ const mod: WidgetModule = {
       setNote("");
       q<HTMLButtonElement>("[data-refresh]").addEventListener("click", () => void refresh());
       q<HTMLButtonElement>("[data-key]").addEventListener("click", () => {
-        ctx.setSettings({ accessToken: "" });
+        void (async () => {
+          accessToken = "";
+          await ctx.deleteSecret("accessToken");
+          rejected = false;
+          showConnect("");
+        })();
       });
     };
 
@@ -124,13 +134,19 @@ const mod: WidgetModule = {
       const tokenInput = q<HTMLInputElement>("[data-token]");
       const userInput = q<HTMLInputElement>("[data-user-input]");
       if (userId) userInput.value = userId;
-      const save = () => {
+      const save = async () => {
         const nextToken = tokenInput.value.trim();
         const nextUser = userInput.value.trim();
         if (!nextToken) return;
-        const patch: Record<string, unknown> = { accessToken: nextToken };
-        patch.userId = nextUser;
-        ctx.setSettings(patch);
+        accessToken = nextToken;
+        await ctx.setSecret("accessToken", nextToken);
+        if (nextUser !== userId) {
+          userId = nextUser;
+          ctx.setSettings({ userId: nextUser });
+        }
+        rejected = false;
+        showMain();
+        void refresh();
       };
       q<HTMLButtonElement>("[data-save]").addEventListener("click", save);
       tokenInput.addEventListener("keydown", (e) => {
@@ -182,18 +198,11 @@ const mod: WidgetModule = {
     };
 
     const offSettings = ctx.onSettings((s) => {
-      const nextToken = asString(s.accessToken);
       const nextUser = asString(s.userId);
-      const changedToken = nextToken !== accessToken;
-      accessToken = nextToken;
+      if (nextUser === userId) return;
       userId = nextUser;
-      if (changedToken) {
-        rejected = false;
-        view = nextToken ? "main" : "connect";
-        if (nextToken) showMain();
-        else showConnect("");
-      }
-      if (nextToken) void refresh();
+      showUser();
+      if (accessToken) void refresh();
     });
 
     if (accessToken) showMain();

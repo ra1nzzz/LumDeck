@@ -14,8 +14,13 @@ pub fn run() {
             Ok(())
         })
         .on_window_event(|_window, event| {
-            if matches!(event, tauri::WindowEvent::Destroyed) {
-                commands::window::restore_taskbar();
+            if matches!(
+                event,
+                tauri::WindowEvent::CloseRequested { .. } | tauri::WindowEvent::Destroyed
+            ) {
+                if let Err(err) = commands::window::restore_taskbar() {
+                    eprintln!("[lumdeck] taskbar restore on window exit failed: {err}");
+                }
             }
         })
         .invoke_handler(tauri::generate_handler![
@@ -24,7 +29,12 @@ pub fn run() {
             commands::dock_position,
             commands::taskbar_autohide,
             commands::open_path,
+            commands::open_web_url,
+            commands::quit_app,
             commands::net_speed,
+            commands::cred_set,
+            commands::cred_get,
+            commands::cred_delete,
         ])
         .run(tauri::generate_context!())
         .expect("error while running LumDeck");
@@ -45,7 +55,7 @@ fn setup_tray(app: &tauri::App) -> tauri::Result<()> {
         .menu(&menu)
         .show_menu_on_left_click(true)
         .on_menu_event(|app, event| match event.id().as_ref() {
-            "quit" => app.exit(0),
+            "quit" => commands::window::quit_app_handle(app),
             "widgets" => {
                 let _ = app.emit("tray:widgets", ());
             }
